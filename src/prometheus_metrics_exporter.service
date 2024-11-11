@@ -1,0 +1,38 @@
+[Unit]
+Description=Prometheus Metrics Exporter
+Documentation=https://github.com/yourusername/prometheus_metrics_exporter
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/etc/prometheus/exporters/venv/bin/python3 /etc/prometheus/exporters/prometheus_metrics_exporter.py
+Restart=always
+RestartSec=10
+
+# Security settings
+NoNewPrivileges=false
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE
+SecureBits=keep-caps
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Hardening (modified to allow user switching)
+ProtectSystem=false
+ReadWritePaths=/var/lib/prometheus /var/lib/algorand /etc/sudoers.d
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
