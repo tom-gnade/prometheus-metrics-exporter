@@ -1,4 +1,4 @@
-#!/etc/prometheus/exporters/venv/bin/python3
+#!/etc/prometheus/exporter/venv/bin/python3 -u
 
 """
 Prometheus Metrics Exporter
@@ -1279,7 +1279,11 @@ class MetricsExporter:
     """Main service class for Prometheus metrics exporter."""
 
     def __init__(self):
+
+        print("Starting MetricsExporter initialization")  # Add this at the very start
         self.running_under_systemd = bool(os.getenv('INVOCATION_ID'))
+        print(f"Running under systemd: {self.running_under_systemd}")  # Add this too
+
         self.shutdown_event = threading.Event()
         
         # Set up logging first, before any other initialization
@@ -1287,7 +1291,6 @@ class MetricsExporter:
         
         # Now load configuration
         try:
-            print(f"DEBUG: Config file path: {self._get_config_path()}")
             self.config = self._load_config()
             print(f"DEBUG: Initial config load: {self.config}")  # Using print since logging isn't configured yet
             print(f"DEBUG: Logging config: {self.config.get('logging', {})}")
