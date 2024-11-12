@@ -8,6 +8,22 @@ This guide covers setting up the Prometheus Metrics Exporter (PME) service.
 - System user with sudo privileges
 - systemd-based Linux system
 
+### Update package list
+apt update
+
+### Install Python 3 if not present
+apt install python3
+
+### Install pip if not present 
+apt install python3-pip
+
+### Install venv module
+apt install python3-venv
+
+### Verify installations
+python3 --version
+pip3 --version
+
 ## Installation Steps
 
 1. Create service directory:
@@ -19,12 +35,13 @@ cd /etc/prometheus/exporter
 2. Set up Python virtual environment:
 ```bash
 sudo python3 -m venv --system-site-packages venv
-sudo venv/bin/pip install --upgrade pip
+sudo venv/bin/python -m pip install --upgrade pip
+sudo apt install -y libsystemd-dev # Installs systemd development libraries required for cysystemd
 ```
 
 3. Install requirements:
 ```bash
-sudo venv/bin/pip install -r requirements.txt
+sudo venv/bin/pip install -r venv/requirements.txt
 ```
 
 4. Copy service files:

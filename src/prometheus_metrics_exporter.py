@@ -45,13 +45,17 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, Optional, Any, List, Tuple, Set, Literal
+from typing import (
+    Awaitable, Any, Callable, Dict, List, 
+    Literal, Optional, Union, Set, Tuple, TypeVar
+    )
 from functools import wraps
 
 # Third party imports
