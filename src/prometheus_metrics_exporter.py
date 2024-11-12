@@ -1335,20 +1335,20 @@ class MetricsExporter:
 
     def _setup_logging(self, config: Dict = None) -> logging.Logger:
         """Set up logging with optional configuration."""
-        logger = logging.getLogger('prometheus_metrics_exporter')
-        logger.setLevel(logging.DEBUG)  # Base level DEBUG to allow all messages
-        
+        logger = None
+        logger = logging.getLogger(os.path.splitext(os.path.basename(sys.argv[0]))[0]) # Logger name is taken from this file's basename
+        log_level = logging.DEBUG
+        logger.setLevel(log_level)  # Default log level
+        max_bytes = 10 * 1024 * 1024  # 10MB default limit of log file size
+        backup_count = 3 # Default limit of log files for rotating file handler
+
         # Get defaults or configured values
         if config:
-            log_level = config.get('level', 'INFO')
-            max_bytes = config.get('max_bytes', 10 * 1024 * 1024)
-            backup_count = config.get('backup_count', 3)
-        else:
-            log_level = 'INFO'
-            max_bytes = 10 * 1024 * 1024  # 10MB
-            backup_count = 3
-        
-        # Create formatter
+            log_level = config.get('level', log_level) # Config to override of log level
+            max_bytes = config.get('max_bytes', max_bytes) # Config override of log file size
+            backup_count = config.get('backup_count', backup_count) # Config override of log file count
+
+        # Create log formatter
         formatter = logging.Formatter(
             '%(asctime)s [%(process)d] [%(threadName)s] '
             '[%(name)s.%(funcName)s] [%(levelname)s] %(message)s',
@@ -1356,28 +1356,28 @@ class MetricsExporter:
         )
         
         # File handler
-        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-        log_file = os.path.join(script_dir, 'prometheus_metrics_exporter.log')
-        
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0])) # Gets the path to this file
+        log_file = os.path.join(script_dir, os.path.splitext(os.path.basename(sys.argv[0]))[0] + '.log') # Sets the full path to the log file
+
         file_handler = RotatingFileHandler(
             log_file,
             maxBytes=max_bytes,
             backupCount=backup_count
         )
-        file_handler.setLevel(logging.DEBUG)
+        file_handler.setLevel(log_level) # Default logging.DEBUG?
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         
         # Console handler
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(getattr(logging, log_level))
+        console_handler.setLevel(log_level) # Always set to log_level
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
         
         # Journal handler for systemd
         if self.running_under_systemd:
             journal_handler = journal.JournaldLogHandler()
-            journal_handler.setLevel(logging.INFO)
+            journal_handler.setLevel(log_level) # Default logging.WARNING?
             journal_handler.setFormatter(formatter)
             logger.addHandler(journal_handler)
         
