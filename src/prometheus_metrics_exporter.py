@@ -18,15 +18,22 @@ Configuration:
 ---------------------
 
 exporter:
-    port: 9101  # Prometheus metrics port
+    metrics_port: 9101  # Prometheus metrics port
+    user: prometheus # User to run commands as
     collection:
         poll_interval_sec: 5  # Global collection interval
         max_workers: 4  # Parallel collection workers
         failure_threshold: 20  # Collection failures before unhealthy
+        collection_timeout_sec: 30 # Timeout for collection operations
     logging:
-        level: "DEBUG"  # Logging detail level
+        level: "DEBUG"  # Main logging level
+        file_level: "DEBUG"  # File logging level
+        console_level: "INFO"  # Console output level
+        journal_level: "WARNING"  # Systemd journal level
         max_bytes: 10485760  # Log file size limit
         backup_count: 3  # Log file rotation count
+        format: "%(asctime)s [%(process)d] [%(threadName)s] [%(name)s.%(funcName)s] [%(levelname)s] %(message)s"  # Log format
+        date_format: "%Y-%m-%d %H:%M:%S"  # Timestamp format
 
 services:
     service_name:  # Each service to monitor
@@ -77,7 +84,7 @@ from typing import (
 
 # Third party imports
 from prometheus_client import (
-   start_http_server, Gauge, make_wsgi_app
+   Counter, Gauge, make_wsgi_app, start_http_server
 )
 from wsgiref.simple_server import make_server
 from cysystemd.daemon import notify, Notification
@@ -157,6 +164,16 @@ class ProgramSource:
             f"No writable log file at {path}"
         )
 
+    @property
+    def sudoers_file(self) -> str:
+        """Name for sudoers configuration file."""
+        return self.base_name
+
+    @property
+    def sudoers_path(self) -> Path:
+        """Full path to sudoers configuration file."""
+        return Path("/etc/sudoers.d") / self.sudoers_file
+
 @dataclass
 class ProgramConfig:
     """Program configuration with dynamic reloading support."""
@@ -164,29 +181,47 @@ class ProgramConfig:
     _config: Dict[str, Any] = field(init=False)
     _last_load_time: float = field(init=False, default=0)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _running_under_systemd: bool = field(init=False)
 
     REQUIRED_SECTIONS = {'exporter', 'services'}
     DEFAULT_VALUES = {
         'exporter': {
-            'port': 9101,
+            'metrics_port': 9101,
+            'health_port': 9102,
+            'user': 'prometheus',
             'collection': {
                 'poll_interval_sec': 5,
-                'parallel_collection': True,
-                'max_workers': 2,
+                'max_workers': 4,
                 'failure_threshold': 20,
                 'collection_timeout_sec': 30
             },
             'logging': {
-                'level': 'INFO',
-                'max_bytes': 10485760,
-                'backup_count': 3
+                'level': 'DEBUG',
+                'max_bytes': 10485760,  # 10MB
+                'backup_count': 3,
+                'file_level': 'DEBUG',
+                'console_level': 'INFO',
+                'journal_level': 'WARNING',
+                'format': '%(asctime)s [%(process)d] [%(threadName)s] [%(name)s.%(funcName)s] [%(levelname)s] %(message)s',
+                'date_format': '%Y-%m-%d %H:%M:%S'
             }
         }
     }
 
     def __post_init__(self):
         """Initial load of configuration."""
+        self._running_under_systemd = bool(os.getenv('INVOCATION_ID'))
         self.load()
+
+    @property
+    def exporter_user(self) -> str:
+        """Get configured exporter user."""
+        return self.exporter.get('user', 'prometheus')
+
+    @property
+    def running_under_systemd(self) -> bool:
+        """Whether the program is running under systemd."""
+        return self._running_under_systemd
 
     @property
     def collection_timeout(self) -> int:
@@ -216,9 +251,9 @@ class ProgramConfig:
         return self.exporter.get('collection', {})
     
     @property
-    def port(self) -> int:
+    def metrics_port(self) -> int:
         """Metrics server port."""
-        return self.exporter['port']
+        return self.exporter['metrics_port']
     
     @property
     def poll_interval(self) -> int:
@@ -266,8 +301,8 @@ class ProgramConfig:
             
         # Validate exporter section
         exporter = config.get('exporter', {})
-        if not isinstance(exporter.get('port', 0), int):
-            raise MetricConfigurationError("Port must be an integer")
+        if not isinstance(exporter.get('metrics_port', 0), int):
+            raise MetricConfigurationError("Metrics port must be an integer")
             
         collection = exporter.get('collection', {})
         if not isinstance(collection.get('poll_interval_sec', 0), (int, float)):
@@ -310,17 +345,136 @@ class ProgramConfig:
         except Exception:
             pass
 
+class ProgramLogger:
+    """Manages logging configuration and setup."""
+
+    def __init__(
+        self,
+        source: ProgramSource,
+        config: ProgramConfig
+    ):
+        self.source = source
+        self.config = config
+        self._logger = self._setup_logging()
+        self._handlers = {}
+
+    @property
+    def logger(self) -> logging.Logger:
+        """Get the configured logger instance."""
+        return self._logger
+        
+    @property
+    def level(self) -> str:
+        """Get current log level."""
+        return logging.getLevelName(self._logger.level)
+    
+    @property
+    def handlers(self) -> Dict[str, logging.Handler]:
+        """Get dictionary of configured handlers."""
+        return self._handlers
+    
+    def set_level(self, level: Union[str, int]) -> None:
+        """Set log level for all handlers."""
+        self._logger.setLevel(level)
+        for handler in self._logger.handlers:
+            handler.setLevel(level)
+            
+    def add_handler(
+        self,
+        name: str,
+        handler: logging.Handler,
+        level: Optional[Union[str, int]] = None
+    ) -> None:
+        """Add a new handler to the logger.
+        
+        Args:
+            name: Identifier for the handler
+            handler: The handler instance to add
+            level: Optional specific level for this handler
+        """
+        if level is not None:
+            handler.setLevel(level)
+        handler.setFormatter(self._get_formatter())
+        self._logger.addHandler(handler)
+        self._handlers[name] = handler
+    
+    def remove_handler(self, name: str) -> None:
+        """Remove a handler by name."""
+        if name in self._handlers:
+            self._logger.removeHandler(self._handlers[name])
+            del self._handlers[name]
+    
+    def _get_formatter(self) -> logging.Formatter:
+        """Create formatter using current settings."""
+        return logging.Formatter(
+            self.config.logging['format'],
+            self.config.logging['date_format']
+        )
+
+    def _setup_logging(self) -> logging.Logger:
+        """Set up logging with configuration from config file."""
+        logger = logging.getLogger(self.source.logger_name)
+        logger.handlers.clear()
+
+        log_level = self.config.logging['level']
+        logger.setLevel(log_level)
+        formatter = self._get_formatter()
+        
+        # File handler
+        file_handler = RotatingFileHandler(
+            self.source.log_path,
+            maxBytes=self.config.logging['max_bytes'],
+            backupCount=self.config.logging['backup_count']
+        )
+        file_handler.setLevel(self.config.logging['file_level'])
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        self._handlers['file'] = file_handler
+        
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(self.config.logging['console_level'])
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        self._handlers['console'] = console_handler
+        
+        # Journal handler for systemd
+        if self.config.running_under_systemd:
+            journal_handler = journal.JournaldLogHandler()
+            journal_handler.setLevel(self.config.logging['journal_level'])
+            journal_handler.setFormatter(formatter)
+            logger.addHandler(journal_handler)
+            self._handlers['journal'] = journal_handler
+        
+        return logger
+
 class MetricType(Enum):
     """Types of metrics supported."""
     GAUGE = "gauge"    # A value that can go up and down (default)
     STATIC = "static"  # Fixed value that rarely changes
+    COUNTER = "counter" # Value that only increases
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> 'MetricType':
+        """Get metric type from config."""
+        if 'type' in config:
+            try:
+                return cls(config['type'].lower())
+            except ValueError:
+                raise MetricConfigurationError(
+                    f"Invalid metric type: {config['type']}. "
+                    f"Must be one of: {[t.value for t in cls]}"
+                )
+        
+        # Default to gauge unless static value present
+        return cls.STATIC if 'value' in config else cls.GAUGE
 
 class ContentType(Enum):
     """Content types for data sources."""
     TEXT = "text" # Use regex pattern matching
     JSON = "json" # Use jq-style path filtering
     
-    def parse_value(self, content: str, filter_expr: str) -> Optional[float]:
+    def parse_value(self, content: str, filter_expr: str, logger: logging.Logger) -> Optional[float]:
         """Parse content based on content type."""
         try:
             if self == ContentType.TEXT:
@@ -331,21 +485,20 @@ class ContentType(Enum):
                 try:
                     data = json.loads(content)
                 except json.JSONDecodeError as e:
-                    logging.error(f"Invalid JSON content: {e}")
+                    logger.error(f"Invalid JSON content: {e}")
                     return None
                     
                 # Handle jq-style filter (e.g. ".status.block_height")
                 try:
-                    original_data = data # Keep for error message
                     for key in filter_expr.strip('.').split('.'):
                         if not isinstance(data, dict):
-                            logging.error(
+                            logger.error(
                                 f"Cannot access '{key}' in path '{filter_expr}': "
                                 f"value '{data}' is not an object"
                             )
                             return None
                         if key not in data:
-                            logging.error(
+                            logger.error(
                                 f"Key '{key}' not found in path '{filter_expr}': "
                                 f"available keys {list(data.keys())}"
                             )
@@ -355,19 +508,19 @@ class ContentType(Enum):
                     try:
                         return float(data)
                     except (TypeError, ValueError) as e:
-                        logging.error(
+                        logger.error(
                             f"Could not convert value '{data}' to float"
                             f"at path '{filter_expr}'")
                         return None
                         
                 except Exception as e:
-                    logging.error(f"Error traversing JSON path: {e}")
+                    logger.error(f"Error traversing JSON path: {e}")
                     return None
                 
             return None
             
         except Exception as e:
-            logging.warning(f"Failed to parse {self.value} response: {e}")
+            logger.warning(f"Failed to parse {self.value} response: {e}")
             return None
 
 @dataclass
@@ -428,14 +581,12 @@ class CommandResult:
 class ServiceUserManager:
     """Manages service users and sudo permissions."""
 
-    SUDOERS_DIR = "/etc/sudoers.d"
-    SUDOERS_FILE = "prometheus-metrics-exporter"
-
     def __init__(self, config: ProgramConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
+        self.source = config._source
         self.service_users: set[str] = set()
-        self.exporter_user = "prometheus"
+        self.exporter_user = config.exporter_user
 
     def collect_service_users(self) -> set[str]:
         """Collect all unique service users from configuration."""
@@ -479,11 +630,11 @@ class ServiceUserManager:
                 self.logger.error("Must be root to update sudo permissions")
                 return False
 
-            sudoers_path = os.path.join(self.SUDOERS_DIR, self.SUDOERS_FILE)
+            sudoers_path = self.source.sudoers_path
+            temp_path =f"{sudoers_path}.tmp"
             
             content = self.generate_sudoers_content()
             
-            temp_path = f"{sudoers_path}.tmp"
             with open(temp_path, 'w') as f:
                 f.write(content)
             
@@ -652,7 +803,7 @@ class CollectionManager:
     def __init__(self, config: ProgramConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
-        self._semaphore = asyncio.Semaphore(self.max_workers)
+        self._semaphore = asyncio.Semaphore(config.max_workers)
     
     async def collect_services(
         self,
@@ -809,7 +960,8 @@ class ServiceMetricsCollector:
             content_type_enum = ContentType(content_type)
             value = content_type_enum.parse_value(
                 source_data,
-                metric_config['filter']
+                metric_config['filter'],
+                self.logger
             )
             
             if value is None and 'value_on_error' in metric_config:
@@ -831,7 +983,8 @@ class MetricsCollector:
         self.logger = logger
         self.stats = CollectionStats()
         self.service_collectors: Dict[str, ServiceMetricsCollector] = {}
-        self._prometheus_metrics: Dict[str, Gauge] = {}
+        self._prometheus_metrics: Dict[str, Union[Gauge, Counter]] = {}
+        self._previous_values: Dict[str, float] = {}
         self.start_time = datetime.now()
         self.collection_manager = CollectionManager(config, logger)
         
@@ -973,17 +1126,25 @@ class MetricsCollector:
 class MetricsExporter:
     """Main service class for Prometheus metrics exporter."""
     
-    def __init__(self):
-        print("Starting MetricsExporter initialization")
-        self.running_under_systemd = bool(os.getenv('INVOCATION_ID'))
-        print(f"Running under systemd: {self.running_under_systemd}")
+    def __init__(
+        self,
+        source: ProgramSource,
+        config: ProgramConfig,
+        logger: logging.Logger
+    ):
+        """Initialize the metrics exporter service.
+        
+        Args:
+            source: Program source information
+            config: Program configuration
+            logger: Configured logger instance
+        """
+        self.source = source
+        self.config = config
+        self.logger = logger
         self.shutdown_event = threading.Event()
         
-        self.source = ProgramSource()
-        self.config = ProgramConfig(self.source)
-
-        # Set up logging first
-        self.logger = self._setup_logging()
+        self.logger.info("Starting metrics exporter initialization")
         
         # Initialize user management
         if os.geteuid() == 0:
@@ -1010,64 +1171,17 @@ class MetricsExporter:
         
         self.logger.info("Metrics exporter initialized")
 
-    def _setup_logging(self, config: Dict = None) -> logging.Logger:
-        """Set up logging with optional configuration."""
-        logger = logging.getLogger(self.source.logger_name)
-        logger.handlers.clear()
-
-        log_level = logging.DEBUG
-        logger.setLevel(log_level)
-        log_level_override = log_level
-        max_bytes = 10 * 1024 * 1024  # 10MB
-        backup_count = 3
-
-        # Get defaults or configured values
-        if self.config.logging:
-            log_level_override = self.config.logging.get('level', log_level)
-
-        # Create formatter
-        formatter = logging.Formatter(
-            '%(asctime)s [%(process)d] [%(threadName)s] '
-            '[%(name)s.%(funcName)s] [%(levelname)s] %(message)s',
-            '%Y-%m-%d %H:%M:%S'
-        )
-        
-        # File handler
-        file_handler = RotatingFileHandler(
-            self.source.log_path,
-            maxBytes=max_bytes,
-            backupCount=backup_count
-        )
-        file_handler.setLevel(logging.DEBUG) # May revert to log_level_override to trim log file output
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-        
-        # Console handler - INFO
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(log_level_override) # May revert to logging.INFO later
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-        
-        # Journal handler - WARNING when under systemd
-        if self.running_under_systemd:
-            journal_handler = journal.JournaldLogHandler()
-            journal_handler.setLevel(logging.WARNING) # Only display WARNING or ERROR to systemd/journald
-            journal_handler.setFormatter(formatter)
-            logger.addHandler(journal_handler)
-        
-        return logger
-
     def _handle_signal(self, signum, frame):
         """Handle shutdown signals."""
         signal_name = signal.Signals(signum).name
         self.logger.info(f"Received {signal_name}, initiating shutdown...")
-        if self.running_under_systemd:
+        if self.config.running_under_systemd:
             notify(Notification.STOPPING)
         self.shutdown_event.set()
 
     def check_ports(self) -> bool:
         """Check if required ports are available."""
-        ports = [self.config.port]
+        ports = [self.config.metrics_port]
         
         for port in ports:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1085,22 +1199,22 @@ class MetricsExporter:
             # Check ports before starting
             if not self.check_ports():
                 self.logger.error("Required ports are not available")
-                if self.running_under_systemd:
+                if self.config.running_under_systemd:
                     notify(Notification.STOPPING)
                 return 1
 
             # Start Prometheus metrics server
             try:
-                start_http_server(self.config.port)
+                start_http_server(self.config.metrics_port)
                 self.logger.info(f"Started Prometheus metrics server on port {self.config.port}")
             except Exception as e:
                 self.logger.error(f"Failed to start metrics server: {e}")
-                if self.running_under_systemd:
+                if self.config.running_under_systemd:
                     notify(Notification.STOPPING)
                 return 1
             
             # Notify systemd we're ready
-            if self.running_under_systemd:
+            if self.config.running_under_systemd:
                 notify(Notification.READY)
             
             # Main collection loop
@@ -1130,7 +1244,7 @@ class MetricsExporter:
             
         except Exception as e:
             self.logger.exception(f"Fatal error in service: {e}")
-            if self.running_under_systemd:
+            if self.config.running_under_systemd:
                 notify(Notification.STOPPING)
             return 1
             
@@ -1140,19 +1254,24 @@ class MetricsExporter:
 async def main():
     """Entry point for the metrics exporter service."""
     try:
-        exporter = MetricsExporter()
-        return await exporter.run()
-    except KeyboardInterrupt:
-        logging.info("Received keyboard interrupt, shutting down...")
-        return 0
+        source = ProgramSource()
+        config = ProgramConfig(source)
+        logger = ProgramLogger(source, config).logger
+
+        try:
+            exporter = MetricsExporter(source, config, logger)
+            return await exporter.run()
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt, shutting down...")
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to start metrics exporter: {e}")
+            return 1
+
     except Exception as e:
-        logging.error(f"Failed to start metrics exporter: {e}")
+        # Only use print for catastrophic failures in logger setup
+        print(f"Fatal error during startup: {e}", file=sys.stderr)
         return 1
 
 if __name__ == '__main__':
-    try:
-        exit_code = asyncio.run(main())
-        sys.exit(exit_code)
-    except Exception as e:
-        logging.error(f"Fatal error in main: {e}")
-        sys.exit(1)
+    sys.exit(asyncio.run(main()))

@@ -9,15 +9,11 @@
 
 # Exporter Configuration
 exporter:
-    port: 9101
+    metrics_port: 9101
     collection:
         poll_interval_sec: 5 # Global polling interval, override with collection_frequency (template, service, metric_group)
-        max_workers: 4 # Parallel collection workers (use 1 for sequential)
-        failure_threshold: 20 # Collection failures before unhealthy
     logging:
         level: "DEBUG"
-        max_bytes: 10485760  # 10MB
-        backup_count: 3
 
 # Services Configuration
 services:
