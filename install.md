@@ -32,6 +32,10 @@ sudo mkdir -p /etc/prometheus/exporter
 cd /etc/prometheus/exporter
 ```
 
+-> Here, download the Git repo using this command:
+curl -L https://api.github.com/repos/tom-gnade/prometheus-metrics-exporter/tarball/main | tar xz --wildcards --strip=2 "*/src"
+
+
 2. Set up Python virtual environment:
 ```bash
 sudo python3 -m venv --system-site-packages venv
