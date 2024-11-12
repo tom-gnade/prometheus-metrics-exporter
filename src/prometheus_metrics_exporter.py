@@ -813,6 +813,7 @@ class MetricsExporter:
         log_level = logging.DEBUG
         logger.setLevel(log_level)
         
+        log_level_override = log_level
         max_bytes = 10 * 1024 * 1024  # 10MB
         backup_count = 3
 
