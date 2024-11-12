@@ -13,27 +13,21 @@ exporter:
     description: "General-purpose metrics collection and exposition"
     version: "4.0.0"
     metrics_port: 9101
-    health_port: 9102
     poll_interval_sec: 5
     parallel_collection: true
     max_workers: 4
     failure_threshold: 20
-
-# Logging Configuration
-logging:
-    level: "DEBUG"
-    max_bytes: 10485760  # 10MB
-    backup_count: 3
-
-# Metric Templates
-metric_templates:
-    30s_json:
-        collection_frequency: 30
-        content_type: "json"
-    
-    300s_json:
-        collection_frequency: 300
-        content_type: "json"
+    logging:
+        level: "DEBUG"
+        max_bytes: 10485760  # 10MB
+        backup_count: 3
+    metric_templates:
+        30s_json:
+            collection_frequency: 30
+            content_type: "json"
+        300s_json:
+            collection_frequency: 300
+            content_type: "json"
 
 # Services Configuration
 services:
