@@ -1,8 +1,17 @@
+# Prometheus Metrics Exporter Configuration
+#
+# Metric Types:
+# - gauge    : A value that can go up and down (default)
+# - static   : Fixed value specified in this configuration
+# - counter  : A value that only increases (not supported)
+# - summary  : Basic statistics about values (not supported)
+# - histogram: Distribution of values in buckets (not supported)
+
 # Exporter Configuration
 exporter:
     name: "Prometheus Metrics Exporter"
     description: "General-purpose metrics collection and exposition"
-    version: "3.0.0"
+    version: "4.0.0"
     metrics_port: 9101
     health_port: 9102
     poll_interval_sec: 5
@@ -16,17 +25,15 @@ logging:
     max_bytes: 10485760  # 10MB
     backup_count: 3
 
-# Service Templates
-service_templates:
-    api_metrics:
+# Metric Templates
+metric_templates:
+    30s_json:
         collection_frequency: 30
         content_type: "json"
-        retry_attempts: 3
     
-    file_monitor:
+    300s_json:
         collection_frequency: 300
         content_type: "json"
-        watch_type: "config"
 
 # Services Configuration
 services:
@@ -35,56 +42,35 @@ services:
         name: "Metrics Exporter"
         description: "Self-monitoring metrics"
         metric_prefix: "exporter_"
-        ordinal: 1
         expose_metrics: true
-        
         metric_groups:
             status:
                 prefix: "status_"
-                ordinal: 1
                 metrics:
-                    uptime:
-                        name: "uptime_seconds"
-                        type: "gauge"
-                        description: "Service uptime in seconds"
-                        category: "health"
+                    up:
+                        type: "static"
+                        description: "Service health indicator (1 = healthy, 0 = unhealthy)"
+                        value: 1.0
+                        value_on_error: 0.0
     
     # Algorand service configuration
     algorand:
         name: "Algorand Node"
         description: "Algorand node monitoring"
-        metric_prefix: "algorand_"
-        ordinal: 2
         expose_metrics: true
-        
         run_as:
             user: algorand
             group: algorand
-            env:
-                ALGORAND_DATA: "/var/lib/algorand"
-        
         metric_groups:
-            node:
-                prefix: "node_"
-                template: "api_metrics"
-                ordinal: 1
+            node_status:
+                command: "/usr/bin/goal node status -d /var/lib/algorand"
                 metrics:
-                    status:
-                        name: "status"
-                        type: "gauge"
-                        description: "Node status information"
-                        command: "sudo -u algorand /usr/bin/goal node status -d /var/lib/algorand"
-                        filter: "Last committed block: (\\d+)"
-                        category: "critical"
-            
-            storage:
-                prefix: "storage_"
-                ordinal: 2
+                    sync_time:
+                        description: "Node synchronization time in seconds"
+                        filter: "Sync Time: ([0-9.]+)s"
+            node_data_store:
+                command: "du -sb /var/lib/algorand"
                 metrics:
-                    data_size:
-                        name: "data_size_bytes"
-                        description: "Algorand data directory size"
-                        command: "sudo -u algorand du -sb /var/lib/algorand"
+                    bytes:
+                        description: "Algorand data storage directory size"
                         filter: "^(\\d+)"
-                        collection_frequency: 300
-                        category: "performance"

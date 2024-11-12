@@ -55,11 +55,13 @@ from pathlib import Path
 from typing import (
     Awaitable, Any, Callable, Dict, List, 
     Literal, Optional, Union, Set, Tuple, TypeVar
-    ) 
+) 
 from functools import wraps
 
 # Third party imports
-from prometheus_client import start_http_server, Gauge, make_wsgi_app
+from prometheus_client import (
+   Gauge, Counter, make_wsgi_app, start_http_server
+)
 from wsgiref.simple_server import make_server
 from cysystemd.daemon import notify, Notification
 from cysystemd import journal
@@ -403,13 +405,15 @@ class UserContext:
             return
 
         try:
+            self.logger.debug(f"Switching from uid={os.getuid()} to user={self.username} (uid={self.user_info.pw_uid})")
             # Store original environment
             original_env = os.environ.copy()
             
             # Switch user/group
             os.setegid(self.group_info.gr_gid)
             os.seteuid(self.user_info.pw_uid)
-            
+            self.logger.debug(f"Current uid after switch: {os.getuid()}")
+
             # Update environment
             if self.env:
                 os.environ.update(self.env)
@@ -423,8 +427,10 @@ class UserContext:
                 yield
             finally:
                 # Restore original user and environment
+                self.logger.debug(f"Restoring original uid={self._original_uid}")
                 os.seteuid(self._original_uid)
                 os.setegid(self._original_gid)
+                self.logger.debug(f"Current uid after restore: {os.getuid()}")
                 os.environ.clear()
                 os.environ.update(original_env)
                 
@@ -705,17 +711,23 @@ class ServiceMetricsCollector:
     async def collect_metrics(self) -> Dict[str, float]:
         """Collect all metrics for this service."""
         results = {}
+        self.logger.debug(f"Starting metrics collection for service: {self.service_name}")
         
         for group_name, group_config in self.service_config.get('metric_groups', {}).items():
+            self.logger.debug(f"Processing metric group: {group_name}")
             if not group_config.get('expose_metrics', True):
+                self.logger.debug(f"Skipping unexposed group: {group_name}")
                 continue
             
             try:
+                self.logger.debug(f"Collecting metrics for group: {group_name}")
                 group_metrics = await self.collect_group(group_name, group_config)
+                self.logger.debug(f"Group {group_name} collection results: {group_metrics}")
                 results.update(group_metrics)
             except Exception as e:
                 self.logger.error(f"Failed to collect metric group {group_name}: {e}")
         
+        self.logger.debug(f"Service {self.service_name} collection completed. Results: {results}")
         return results
     
     async def collect_group(
@@ -724,13 +736,19 @@ class ServiceMetricsCollector:
         group_config: Dict
     ) -> Dict[str, float]:
         """Collect all metrics in a group from a single source read."""
+        self.logger.debug(f"Starting collection for group {group_name}")
+
         if not self._should_collect_group(group_config):
+            self.logger.debug(f"Skipping collection for group {group_name} - not due yet")
             return self._get_cached_group_metrics(group_name)
             
         try:
             # Get the source data once for the entire group
             source_data = await self._get_group_source_data(group_config)
+            self.logger.debug(f"Got source data for group {group_name}: {source_data}")
+
             if source_data is None:
+                self.logger.debug(f"No source data for group {group_name}")
                 return {}
             
             results = {}
@@ -739,12 +757,7 @@ class ServiceMetricsCollector:
             # Process all metrics using the single source data
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    if metric_config.get('type') == 'static':
-                        # Static metrics don't need source data
-                        value = float(metric_config['value'])
-                    else:
-                        # Parse metric from the shared source data
-                        value = self._parse_metric_value(source_data, metric_config)
+                    value = self._parse_metric_value(source_data, metric_config)
                     
                     if value is not None:
                         full_metric_name = (
@@ -798,6 +811,12 @@ class ServiceMetricsCollector:
     ) -> Optional[float]:
         """Parse individual metric value from group's source data."""
         try:
+            # Handle static metrics
+            if metric_config.get('type') == 'static':
+                self.logger.debug(f"Processing static metric with config: {metric_config}")
+                return float(metric_config['value'])
+
+            # Handle other metric types
             content_type = metric_config.get('content_type', 'text')
             content_type_enum = ContentType(content_type)
             value = content_type_enum.parse_value(
@@ -1335,8 +1354,8 @@ class MetricsExporter:
 
     def _setup_logging(self, config: Dict = None) -> logging.Logger:
         """Set up logging with optional configuration."""
-        logger = None
         logger = logging.getLogger(os.path.splitext(os.path.basename(sys.argv[0]))[0]) # Logger name is taken from this file's basename
+        logger.handlers.clear() # Clear any existing handlers
         log_level = logging.DEBUG
         logger.setLevel(log_level)  # Default log level
         max_bytes = 10 * 1024 * 1024  # 10MB default limit of log file size
@@ -1364,20 +1383,20 @@ class MetricsExporter:
             maxBytes=max_bytes,
             backupCount=backup_count
         )
-        file_handler.setLevel(log_level) # Default logging.DEBUG?
+        file_handler.setLevel(log_level) # Uses configured level (defaults to DEBUG)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         
         # Console handler
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(log_level) # Always set to log_level
+        console_handler.setLevel(log_level) # Uses configured level (defaults to DEBUG)
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
         
         # Journal handler for systemd
         if self.running_under_systemd:
             journal_handler = journal.JournaldLogHandler()
-            journal_handler.setLevel(log_level) # Default logging.WARNING?
+            journal_handler.setLevel(log_level) # Uses configured level (defaults to DEBUG)
             journal_handler.setFormatter(formatter)
             logger.addHandler(journal_handler)
         
