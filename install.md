@@ -60,7 +60,8 @@ sudo vim /etc/prometheus/exporter/prometheus_metrics_exporter.yml
 ```bash
 sudo chown -R prometheus:prometheus /etc/prometheus/exporter &&
 sudo chmod 755 /etc/prometheus/exporter &&
-sudo chmod 644 /etc/prometheus/exporter/prometheus_metrics_exporter.yml
+sudo chmod 644 /etc/prometheus/exporter/prometheus_metrics_exporter.yml &&
+sudo chmod 755 /etc/prometheus/exporter/prometheus_metrics_exporter.py
 ```
 # Set correct ownership for all necessary files
 chown prometheus:prometheus prometheus_metrics_exporter.py prometheus_metrics_exporter.yml requirements.txt
