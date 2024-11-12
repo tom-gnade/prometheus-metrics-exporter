@@ -14,13 +14,34 @@ A flexible metrics collection and exposition service supporting:
 - Error handling and health checks
 - Automatic user permission management
 
-Usage:
-    1. Configure services and metrics in the YAML config file
-    2. Run directly or as a systemd service
-    3. Access metrics at http://localhost:<metrics_port>/metrics
-    4. Access health at http://localhost:<health_port>/health
+Configuration:
+---------------------
 
-Note: in VS Code, use CTRL+K, CTRL+0 tol collapse all, CTRL+K, CTRL+J to expand all code segments
+exporter:
+    port: 9101  # Prometheus metrics port
+    collection:
+        poll_interval_sec: 5  # Global collection interval
+        max_workers: 4  # Parallel collection workers
+        failure_threshold: 20  # Collection failures before unhealthy
+    logging:
+        level: "DEBUG"  # Logging detail level
+        max_bytes: 10485760  # Log file size limit
+        backup_count: 3  # Log file rotation count
+
+services:
+    service_name:  # Each service to monitor
+        description: "Service description"
+        run_as:  username # Optional username to execute commands
+        metric_groups:
+            group_name:  # Logical grouping of metrics that share a single command
+                command: "shell command that produces output"  # Command to execute
+                metrics:
+                    metric_name:
+                        description: "Metric description"
+                        filter: "regex or jq-style filter"  # Text regex or JSON filter
+                        content_type: "text|json"  # How to parse command output, default text
+                        value: 1.0 # Optional, only specified for "static" metrics
+                        value_on_error: 0.0  # Optional, override value on failure (static or gauge)
 """
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
@@ -43,16 +64,21 @@ import threading
 import time
 from concurrent.futures import Future
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Awaitable, Any, Dict, List, Optional, Union
-from functools import wraps
+from typing import (
+    Awaitable, Any, Dict, List, Optional, 
+    TYPE_CHECKING, Union
+)
 
 # Third party imports
-from prometheus_client import start_http_server, Gauge, make_wsgi_app
+from prometheus_client import (
+   start_http_server, Gauge, make_wsgi_app
+)
 from wsgiref.simple_server import make_server
 from cysystemd.daemon import notify, Notification
 from cysystemd import journal
@@ -87,6 +113,203 @@ class UserConfigurationError(Exception):
 # Core Enums and Data Classes
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
+@dataclass(frozen=True)
+class ProgramSource:
+    """Program source and derived file configurations."""
+    script_path: Path = field(default_factory=lambda: Path(sys.argv[0]).resolve())
+    
+    @property
+    def script_dir(self) -> Path:
+        """Directory containing the script."""
+        return self.script_path.parent
+    
+    @property
+    def base_name(self) -> str:
+        """Base name without extension."""
+        return self.script_path.stem
+        
+    @property
+    def logger_name(self) -> str:
+        """Logger name derived from script name."""
+        return self.base_name
+    
+    @property
+    def config_path(self) -> Path:
+        """Full path to config file."""
+        path = self.script_dir / f"{self.base_name}.yml"
+        if path.is_file() and os.access(path, os.R_OK):
+            return path
+
+        raise FileNotFoundError(
+            f"Config file {path} not found"
+        )
+
+    @property
+    def log_path(self) -> Path:
+        """Full path to log file."""
+        path = self.script_dir / f"{self.base_name}.log"
+        if not path.exists():
+            path.touch()
+        if os.access(path, os.W_OK):
+            return path
+
+        raise PermissionError(
+            f"No writable log file at {path}"
+        )
+
+@dataclass
+class ProgramConfig:
+    """Program configuration with dynamic reloading support."""
+    _source: ProgramSource
+    _config: Dict[str, Any] = field(init=False)
+    _last_load_time: float = field(init=False, default=0)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+
+    REQUIRED_SECTIONS = {'exporter', 'services'}
+    DEFAULT_VALUES = {
+        'exporter': {
+            'port': 9101,
+            'collection': {
+                'poll_interval_sec': 5,
+                'parallel_collection': True,
+                'max_workers': 2,
+                'failure_threshold': 20,
+                'collection_timeout_sec': 30
+            },
+            'logging': {
+                'level': 'INFO',
+                'max_bytes': 10485760,
+                'backup_count': 3
+            }
+        }
+    }
+
+    def __post_init__(self):
+        """Initial load of configuration."""
+        self.load()
+
+    @property
+    def collection_timeout(self) -> int:
+        """Collection timeout in seconds."""
+        return self.collection.get('collection_timeout_sec', 30)
+
+    @property
+    def exporter(self) -> Dict[str, Any]:
+        """Exporter configuration section."""
+        self._check_reload()
+        return self._config['exporter']
+    
+    @property
+    def services(self) -> Dict[str, Any]:
+        """Services configuration section."""
+        self._check_reload()
+        return self._config['services']
+
+    @property
+    def logging(self) -> Dict[str, Any]:
+        """Logging configuration section."""
+        return self.exporter.get('logging', {})
+
+    @property
+    def collection(self) -> Dict[str, Any]:
+        """Collection configuration section."""
+        return self.exporter.get('collection', {})
+    
+    @property
+    def port(self) -> int:
+        """Metrics server port."""
+        return self.exporter['port']
+    
+    @property
+    def poll_interval(self) -> int:
+        """Collection polling interval."""
+        return self.collection.get('poll_interval_sec', 5)
+    
+    @property
+    def max_workers(self) -> int:
+        """Maximum parallel collection workers."""
+        return self.collection.get('max_workers', 4)
+    
+    @property
+    def failure_threshold(self) -> int:
+        """Failure threshold for health checking."""
+        return self.collection.get('failure_threshold', 20)
+
+    def get_service(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get service configuration by name."""
+        return self.services.get(name)
+
+    def get_service_metrics(self, service_name: str, group_name: str) -> Dict[str, Any]:
+        """Get metrics configuration for a service group."""
+        service = self.get_service(service_name)
+        if not service:
+            return {}
+        return service.get('metric_groups', {}).get(group_name, {}).get('metrics', {})
+
+    def _merge_defaults(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge configuration with default values."""
+        result = deepcopy(self.DEFAULT_VALUES)
+        for key, value in config.items():
+            if isinstance(value, dict) and key in result:
+                result[key].update(value)
+            else:
+                result[key] = value
+        return result
+
+    def _validate_config(self, config: Dict[str, Any]) -> None:
+        """Validate configuration structure and types."""
+        if not config:
+            raise MetricConfigurationError("Empty configuration")
+            
+        if missing := self.REQUIRED_SECTIONS - set(config):
+            raise MetricConfigurationError(f"Missing required sections: {missing}")
+            
+        # Validate exporter section
+        exporter = config.get('exporter', {})
+        if not isinstance(exporter.get('port', 0), int):
+            raise MetricConfigurationError("Port must be an integer")
+            
+        collection = exporter.get('collection', {})
+        if not isinstance(collection.get('poll_interval_sec', 0), (int, float)):
+            raise MetricConfigurationError("Poll interval must be a number")
+            
+        # Validate services section
+        services = config.get('services', {})
+        if not isinstance(services, dict):
+            raise MetricConfigurationError("Services must be a dictionary")
+            
+        for service_name, service_config in services.items():
+            if not isinstance(service_config, dict):
+                raise MetricConfigurationError(
+                    f"Service {service_name} configuration must be a dictionary"
+                )
+
+    def load(self) -> None:
+        """Load configuration from file with thread safety."""
+        with self._lock:
+            try:
+                with open(self._source.config_path) as f:
+                    config = yaml.safe_load(f)
+                
+                self._validate_config(config)
+                config = self._merge_defaults(config)
+                
+                self._config = config
+                self._last_load_time = self._source.config_path.stat().st_mtime
+                
+            except Exception as e:
+                if not hasattr(self, '_config'):
+                    raise MetricConfigurationError(f"Failed to load initial config: {e}")
+
+    def _check_reload(self) -> None:
+        """Check if config file has been modified and reload if needed."""
+        try:
+            current_mtime = self._source.config_path.stat().st_mtime
+            if current_mtime > self._last_load_time:
+                self.load()
+        except Exception:
+            pass
+
 class MetricType(Enum):
     """Types of metrics supported."""
     GAUGE = "gauge"    # A value that can go up and down (default)
@@ -94,9 +317,8 @@ class MetricType(Enum):
 
 class ContentType(Enum):
     """Content types for data sources."""
-    TEXT = "text"
-    JSON = "json"
-    PROMETHEUS = "prometheus"
+    TEXT = "text" # Use regex pattern matching
+    JSON = "json" # Use jq-style path filtering
     
     def parse_value(self, content: str, filter_expr: str) -> Optional[float]:
         """Parse content based on content type."""
@@ -106,16 +328,41 @@ class ContentType(Enum):
                 return float(match.group(1)) if match else None
                 
             elif self == ContentType.JSON:
-                data = json.loads(content)
-                for key in filter_expr.strip('.').split('.'):
-                    data = data[key]
-                return float(data)
-                
-            elif self == ContentType.PROMETHEUS:
-                for line in content.splitlines():
-                    if line.startswith(filter_expr):
-                        return float(line.split()[-1])
-                return None
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError as e:
+                    logging.error(f"Invalid JSON content: {e}")
+                    return None
+                    
+                # Handle jq-style filter (e.g. ".status.block_height")
+                try:
+                    original_data = data # Keep for error message
+                    for key in filter_expr.strip('.').split('.'):
+                        if not isinstance(data, dict):
+                            logging.error(
+                                f"Cannot access '{key}' in path '{filter_expr}': "
+                                f"value '{data}' is not an object"
+                            )
+                            return None
+                        if key not in data:
+                            logging.error(
+                                f"Key '{key}' not found in path '{filter_expr}': "
+                                f"available keys {list(data.keys())}"
+                            )
+                            return None
+                        data = data[key]
+                        
+                    try:
+                        return float(data)
+                    except (TypeError, ValueError) as e:
+                        logging.error(
+                            f"Could not convert value '{data}' to float"
+                            f"at path '{filter_expr}'")
+                        return None
+                        
+                except Exception as e:
+                    logging.error(f"Error traversing JSON path: {e}")
+                    return None
                 
             return None
             
@@ -174,12 +421,6 @@ class CommandResult:
     execution_time: float = 0
     timestamp: datetime = field(default_factory=datetime.now)
 
-@dataclass
-class MetricTemplate:
-    """Template for metric collection configuration."""
-    collection_frequency: int = 0
-    content_type: ContentType = ContentType.TEXT
-
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # User Management
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
@@ -190,42 +431,44 @@ class ServiceUserManager:
     SUDOERS_DIR = "/etc/sudoers.d"
     SUDOERS_FILE = "prometheus-metrics-exporter"
 
-    def __init__(self, config: Dict[str, Any], logger: logging.Logger):
+    def __init__(self, config: ProgramConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
         self.service_users: set[str] = set()
         self.exporter_user = "prometheus"
-        self.allowed_commands = {
-            'du': '/usr/bin/du',
-            'goal': '/usr/bin/goal',
-            'systemctl': '/usr/bin/systemctl',
-            'cat': '/bin/cat'
-        }
 
     def collect_service_users(self) -> set[str]:
         """Collect all unique service users from configuration."""
         users = {self.exporter_user}
         
-        for service_config in self.config.get('services', {}).values():
+        for service_config in self.config.services.values():
             if 'run_as' in service_config:
-                user = service_config['run_as'].get('user')
-                if user:
-                    users.add(user)
+                users.add(service_config['run_as'])
         
         self.service_users = users
         return users
 
     def generate_sudoers_content(self) -> str:
-        """Generate sudoers file content for all service users."""
+        """Generate sudoers file content with unrestricted command access.
+    
+        Note: Security is maintained through proper system user permissions
+        rather than command restrictions. Each service user should be
+        configured with appropriate system-level access controls.
+        """
         content = [
             "# Auto-generated by Prometheus Metrics Exporter",
             "# Do not edit manually - changes will be overwritten",
+            f"# Generated at {datetime.now().isoformat()}",
+            "",
+            "# Security Note:",
+            "# Access control is managed through system user permissions",
+            "# Each service user should have appropriate system-level restrictions",
+            f"# The {self.exporter_user} user can only run commands as defined service users",
             ""
         ]
 
         for user in sorted(self.service_users - {self.exporter_user}):
-            for cmd_name, cmd_path in sorted(self.allowed_commands.items()):
-                content.append(f"{self.exporter_user} ALL=({user}) NOPASSWD: {cmd_path}")
+            content.append(f"{self.exporter_user} ALL=({user}) NOPASSWD: ALL")
 
         return "\n".join(content) + "\n"
 
@@ -285,19 +528,17 @@ class ServiceUserManager:
 class UserContext:
     """Manages user context for command execution."""
     
-    def __init__(self, run_as_config: Dict[str, Any], logger: logging.Logger):
-        self.config = run_as_config
+    def __init__(self, username: str, logger: logging.Logger):
         self.logger = logger
         self._original_uid = os.getuid()
         self._original_gid = os.getgid()
         self._enabled = self._original_uid == 0
         
-        self.username = run_as_config['user']
-        self.groupname = run_as_config.get('group', self.username)
+        self.username = username
         
         try:
             self.user_info = pwd.getpwnam(self.username)
-            self.group_info = grp.getgrnam(self.groupname)
+            self.group_info = grp.getgrgid(self.user_info.pw_gid)
         except KeyError as e:
             self.logger.error(f"Invalid user or group: {e}")
             self._enabled = False
@@ -405,14 +646,12 @@ class CommandExecutor:
 # Metrics Collection
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
-class ParallelCollectionManager:
+class CollectionManager:
     """Manages parallel collection at service and group levels."""
     
-    def __init__(self, config: Dict[str, Any], logger: logging.Logger):
+    def __init__(self, config: ProgramConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
-        self.max_workers = config.get('exporter', {}).get('max_workers', 4)
-        self.timeout = config.get('exporter', {}).get('collection_timeout_sec', 30)
         self._semaphore = asyncio.Semaphore(self.max_workers)
     
     async def collect_services(
@@ -447,7 +686,7 @@ class ParallelCollectionManager:
         """Execute coroutine with timeout and semaphore."""
         try:
             async with self._semaphore:
-                return await asyncio.wait_for(coro, timeout=self.timeout)
+                return await asyncio.wait_for(coro, timeout=self.config.collection_timeout)
         except asyncio.TimeoutError:
             self.logger.error(f"Collection timed out for {identifier}")
             return None
@@ -467,14 +706,14 @@ class ServiceMetricsCollector:
         self.service_name = service_name
         self.service_config = service_config
         self.logger = logger
-        self.metrics: Dict[str, Dict] = {}
         self.command_executor = CommandExecutor(logger)
         
         # Set up user context if specified
         self.user_context = None
         if 'run_as' in service_config:
             try:
-                self.user_context = UserContext(service_config['run_as'], logger)
+                username = service_config['run_as']
+                self.user_context = UserContext(username, logger)
             except Exception as e:
                 self.logger.error(f"Failed to initialize user context for {service_name}: {e}")
     
@@ -516,11 +755,12 @@ class ServiceMetricsCollector:
                     command,
                     self.user_context
                 )
-                source_data = result.output if result.success else None
-                self.logger.debug(f"Command execution result: {result}")
             else:
-                self.logger.error(f"No command specified for group {group_name}")
+                self.logger.debug(f"No command specified for group {group_name}")
                 return {}
+            
+            source_data = result.output if result.success else None
+            self.logger.debug(f"Command execution result: {result}")
 
             if source_data is None:
                 self.logger.debug(f"No source data for group {group_name}")
@@ -538,10 +778,7 @@ class ServiceMetricsCollector:
                     
                     if value is not None:
                         results[full_metric_name] = value
-                        self.metrics[metric_name] = {
-                            'last_value': value,
-                            'last_collection': time.time()
-                        }
+
                 except Exception as e:
                     self.logger.error(f"Failed to parse metric {metric_name}: {e}")
                     
@@ -558,13 +795,16 @@ class ServiceMetricsCollector:
     ) -> Optional[float]:
         """Parse individual metric value from group's source data."""
         try:
-            # Handle static metrics
-            if metric_config.get('type') == 'static':
-                self.logger.debug("Processing static metric with value: %s", 
-                                metric_config.get('value'))
+            # Infer static type if value is present
+            if 'value' in metric_config:
+                self.logger.debug("Processing static metric with value: %s", metric_config['value'])
                 return float(metric_config['value'])
-
-            # Handle gauge metrics (default)
+            
+            # All other metrics are gauges using the filter
+            if source_data is None:
+                self.logger.debug("No source data available")
+                return metric_config.get('value_on_error')
+            
             content_type = metric_config.get('content_type', 'text')
             content_type_enum = ContentType(content_type)
             value = content_type_enum.parse_value(
@@ -574,52 +814,26 @@ class ServiceMetricsCollector:
             
             if value is None and 'value_on_error' in metric_config:
                 return metric_config['value_on_error']
-
+            
             return value
-
+            
         except Exception as e:
             self.logger.error(f"Failed to parse value: {e}")
             if 'value_on_error' in metric_config:
                 return metric_config['value_on_error']
             return None
 
-    def _should_collect_group(self, group_config: Dict) -> bool:
-        """Determine if group should be collected based on frequency."""
-        frequency = group_config.get('collection_frequency', 0)
-        if frequency == 0:
-            return True
-
-        last_collection = min(
-            self.metrics.get(metric_name, {}).get('last_collection', 0)
-            for metric_name in group_config.get('metrics', {})
-        )
-
-        return (time.time() - last_collection) >= frequency
-
-    def _get_cached_group_metrics(self, group_name: str) -> Dict[str, float]:
-        """Get cached metrics for a group."""
-        results = {}
-        group_config = self.service_config['metric_groups'][group_name]
-        
-        for metric_name in group_config.get('metrics', {}):
-            if metric_name in self.metrics:
-                full_metric_name = f"{self.service_name}_{group_name}_{metric_name}"
-                results[full_metric_name] = self.metrics[metric_name]['last_value']
-        
-        return results
-
-
 class MetricsCollector:
     """Main metrics collector managing multiple services."""
     
-    def __init__(self, config: Dict[str, Any], logger: logging.Logger):
+    def __init__(self, config: ProgramConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
         self.stats = CollectionStats()
         self.service_collectors: Dict[str, ServiceMetricsCollector] = {}
         self._prometheus_metrics: Dict[str, Gauge] = {}
         self.start_time = datetime.now()
-        self.parallel_manager = ParallelCollectionManager(config, logger)
+        self.collection_manager = CollectionManager(config, logger)
         
         # Initialize collectors for each service
         self._initialize_collectors()
@@ -629,8 +843,7 @@ class MetricsCollector:
     
     def _initialize_collectors(self):
         """Initialize collectors for each service."""
-        services = self.config.get('services', {})
-        for service_name, service_config in services.items():
+        for service_name, service_config in self.config.services.items():
             try:
                 self.service_collectors[service_name] = ServiceMetricsCollector(
                     service_name,
@@ -679,7 +892,7 @@ class MetricsCollector:
             self._internal_metrics['uptime'].set(self.get_uptime())
             
             # Collect from all services in parallel
-            service_results = await self.parallel_manager.collect_services(
+            service_results = await self.collection_manager.collect_services(
                 self.service_collectors
             )
             
@@ -766,21 +979,11 @@ class MetricsExporter:
         print(f"Running under systemd: {self.running_under_systemd}")
         self.shutdown_event = threading.Event()
         
+        self.source = ProgramSource()
+        self.config = ProgramConfig(self.source)
+
         # Set up logging first
         self.logger = self._setup_logging()
-        
-        # Load configuration
-        try:
-            self.config = self._load_config()
-            print(f"DEBUG: Initial config load: {self.config}")
-            print(f"DEBUG: Logging config: {self.config.get('logging', {})}")
-            
-            # Reinitialize logging with config
-            if 'logging' in self.config:
-                self.logger = self._setup_logging(self.config['logging'])
-        except Exception as e:
-            self.logger.error(f"Failed to load configuration: {e}")
-            raise
         
         # Initialize user management
         if os.geteuid() == 0:
@@ -809,20 +1012,18 @@ class MetricsExporter:
 
     def _setup_logging(self, config: Dict = None) -> logging.Logger:
         """Set up logging with optional configuration."""
-        logger = logging.getLogger(os.path.splitext(os.path.basename(sys.argv[0]))[0])
+        logger = logging.getLogger(self.source.logger_name)
         logger.handlers.clear()
+
         log_level = logging.DEBUG
         logger.setLevel(log_level)
-        
         log_level_override = log_level
         max_bytes = 10 * 1024 * 1024  # 10MB
         backup_count = 3
 
         # Get defaults or configured values
-        if config:
-            log_level_override = config.get('level', log_level)
-            max_bytes = config.get('max_bytes', max_bytes)
-            backup_count = config.get('backup_count', backup_count)
+        if self.config.logging:
+            log_level_override = self.config.logging.get('level', log_level)
 
         # Create formatter
         formatter = logging.Formatter(
@@ -831,12 +1032,9 @@ class MetricsExporter:
             '%Y-%m-%d %H:%M:%S'
         )
         
-        # File handler - always DEBUG
-        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-        log_file = os.path.join(script_dir, os.path.splitext(os.path.basename(sys.argv[0]))[0] + '.log')
-
+        # File handler
         file_handler = RotatingFileHandler(
-            log_file,
+            self.source.log_path,
             maxBytes=max_bytes,
             backupCount=backup_count
         )
@@ -859,32 +1057,6 @@ class MetricsExporter:
         
         return logger
 
-    def _load_config(self) -> Dict[str, Any]:
-        """Load and validate configuration."""
-        config_path = os.path.join(
-            os.path.dirname(os.path.abspath(sys.argv[0])),
-            os.path.splitext(os.path.basename(sys.argv[0]))[0] + '.yml'
-        )
-        self.logger.debug(f"Loading config from: {config_path}")
-        
-        try:
-            with open(config_path) as f:
-                config = yaml.safe_load(f)
-                self.logger.debug(f"Loaded config: {config}")
-                
-            if not config:
-                raise MetricConfigurationError("Empty configuration file")
-                
-            required_sections = ['exporter', 'services']
-            for section in required_sections:
-                if section not in config:
-                    raise MetricConfigurationError(f"Missing required section: {section}")
-            
-            return config
-            
-        except Exception as e:
-            raise MetricConfigurationError(f"Failed to load config: {e}")
-
     def _handle_signal(self, signum, frame):
         """Handle shutdown signals."""
         signal_name = signal.Signals(signum).name
@@ -895,9 +1067,7 @@ class MetricsExporter:
 
     def check_ports(self) -> bool:
         """Check if required ports are available."""
-        ports = [
-            self.config['exporter']['metrics_port']
-        ]
+        ports = [self.config.port]
         
         for port in ports:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -921,11 +1091,8 @@ class MetricsExporter:
 
             # Start Prometheus metrics server
             try:
-                start_http_server(self.config['exporter']['metrics_port'])
-                self.logger.info(
-                    f"Started Prometheus metrics server on port "
-                    f"{self.config['exporter']['metrics_port']}"
-                )
+                start_http_server(self.config.port)
+                self.logger.info(f"Started Prometheus metrics server on port {self.config.port}")
             except Exception as e:
                 self.logger.error(f"Failed to start metrics server: {e}")
                 if self.running_under_systemd:
@@ -940,20 +1107,17 @@ class MetricsExporter:
             while not self.shutdown_event.is_set():
                 try:
                     loop_start = time.time()
-                    
-                    # Collect metrics
                     await self.metrics_collector.collect_all_metrics()
                     
-                    # Calculate sleep time
                     elapsed = time.time() - loop_start
-                    sleep_time = max(0, self.config['exporter']['poll_interval_sec'] - elapsed)
+                    sleep_time = max(0, self.config.poll_interval - elapsed)
                     
                     if sleep_time > 0:
                         await asyncio.sleep(sleep_time)
                     else:
                         self.logger.warning(
                             f"Collection took longer than poll interval "
-                            f"({elapsed:.2f}s > {self.config['exporter']['poll_interval_sec']}s)"
+                            f"({elapsed:.2f}s > {self.config.poll_interval}s)"
                         )
                     
                 except Exception as e:
