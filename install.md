@@ -8,21 +8,17 @@ This guide covers setting up the Prometheus Metrics Exporter (PME) service.
 - System user with sudo privileges
 - systemd-based Linux system
 
+### Add repository for Python 3.11
+add-apt-repository ppa:deadsnakes/ppa
+
 ### Update package list
 apt update
 
-### Install Python 3 if not present
-apt install python3
+### Install Python 3.11 and dependencies
+apt install python3.11 python3.11-venv python3.11-dev
 
-### Install pip if not present 
-apt install python3-pip
-
-### Install venv module
-apt install python3-venv
-
-### Verify installations
-python3 --version
-pip3 --version
+### Verify installation
+python3.11 --version
 
 ## Installation Steps
 
@@ -38,14 +34,13 @@ curl -L https://api.github.com/repos/tom-gnade/prometheus-metrics-exporter/tarba
 
 2. Set up Python virtual environment:
 ```bash
-sudo python3 -m venv --system-site-packages venv
-sudo venv/bin/python -m pip install --upgrade pip
+sudo python3.11 -m venv --system-site-packages venv
+sudo ./venv/bin/python -m pip install --upgrade pip
 sudo apt install -y libsystemd-dev # Installs systemd development libraries required for cysystemd
 ```
-
 3. Install requirements:
 ```bash
-sudo venv/bin/pip install -r venv/requirements.txt
+sudo ./venv/bin/pip install -r requirements.txt
 ```
 
 4. Copy service files:
@@ -63,10 +58,18 @@ sudo vim /etc/prometheus/exporter/prometheus_metrics_exporter.yml
 
 6. Set permissions:
 ```bash
-sudo chown -R prometheus:prometheus /etc/prometheus/exporter
-sudo chmod 755 /etc/prometheus/exporter
+sudo chown -R prometheus:prometheus /etc/prometheus/exporter &&
+sudo chmod 755 /etc/prometheus/exporter &&
 sudo chmod 644 /etc/prometheus/exporter/prometheus_metrics_exporter.yml
 ```
+# Set correct ownership for all necessary files
+chown prometheus:prometheus prometheus_metrics_exporter.py prometheus_metrics_exporter.yml requirements.txt
+chown -R prometheus:prometheus venv/
+
+# Make sure files are readable
+chmod 644 prometheus_metrics_exporter.yml
+chmod 755 prometheus_metrics_exporter.py
+
 
 7. Enable and start service:
 ```bash

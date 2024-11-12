@@ -1287,8 +1287,11 @@ class MetricsExporter:
         
         # Now load configuration
         try:
+            print(f"DEBUG: Config file path: {self._get_config_path()}")
             self.config = self._load_config()
-            
+            print(f"DEBUG: Initial config load: {self.config}")  # Using print since logging isn't configured yet
+            print(f"DEBUG: Logging config: {self.config.get('logging', {})}")
+
             # Reinitialize logging with loaded config if available
             if 'logging' in self.config:
                 self.logger = self._setup_logging(self.config['logging'])
