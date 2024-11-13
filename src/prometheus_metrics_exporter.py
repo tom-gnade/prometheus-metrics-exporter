@@ -26,8 +26,8 @@ Configuration:
 ---------------------
 
 exporter:
-    metrics_port: 9101  # Prometheus metrics port
-    health_port: 9102   # Health check port
+    metrics_port: 9101  # Prometheus metrics port (requires restart to change)
+    health_port: 9102   # Health check port (requires restart to change)
     user: prometheus    # User to run commands as
     collection:
         poll_interval_sec: 5    # Global collection interval
@@ -43,6 +43,8 @@ exporter:
         backup_count: 3        # Log file rotation count
         format: "%(asctime)s [%(process)d] [%(threadName)s] [%(name)s.%(funcName)s] [%(levelname)s] %(message)s"
         date_format: "%Y-%m-%d %H:%M:%S"
+
+# Note: All exporter section changes require service restart
 
 services:
     service_name:              # Each service to monitor
@@ -61,6 +63,8 @@ services:
                         value: 1.0  # Required for static metrics
                         value_on_error: 0.0  # Optional fallback value
 
+# Note: Services section supports runtime reloading
+
 Health Check API:
 ---------------------
 GET /health
@@ -76,9 +80,11 @@ Response Codes:
 
 Features:
 ---------------------
-- Dynamic configuration reloading
+- Dynamic configuration reloading with optimistic validation
+- Partial configuration updates (services only)
+- Graceful handling of configuration errors
 - Parallel metric collection
-- User context switching for command execution
+- User context switching for command execution 
 - Prometheus metrics exposition
 - Health check endpoint with detailed status
 - Comprehensive logging with rotation
@@ -98,6 +104,9 @@ Notes:
 - Configuration file must be in same directory as script
 - Script must run as root for user switching functionality
 - Proper sudo rules are required for user context switching
+- Exporter section changes require service restart
+- Services section supports live reloading with validation
+- Invalid configuration components are skipped with warnings
 """
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
@@ -224,14 +233,25 @@ class ProgramSource:
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
-@dataclass
 class ProgramConfig:
     """Program configuration with dynamic reloading support.
     
     All timestamps in this application are in UTC. The now_utc() method
     should be used to get the current time, and all stored timestamps
     should be UTC-aware datetime objects.
+    
+    Configuration is divided into two sections:
+    - exporter: Static configuration that requires service restart to modify
+    - services: Dynamic configuration that supports runtime changes
+    
+    Features:
+    - Optimistic validation of service configurations
+    - Graceful handling of partial configuration failures
+    - Detailed validation reporting and statistics
+    - Automatic rollback on validation failures
+    - Clear warning messages for ignored exporter changes
     """
+
     REQUIRED_SECTIONS = {'services'}
     DEFAULT_VALUES = {
         'exporter': {
@@ -261,169 +281,126 @@ class ProgramConfig:
         """Initialize configuration manager."""
         self._source = source
         self._config: Dict[str, Any] = {}
-        self._initial_exporter: Dict[str, Any] = {}
         self._last_load_time: float = 0
         self._lock: threading.Lock = threading.Lock()
         self._running_under_systemd: bool = bool(os.getenv('INVOCATION_ID'))
         self._start_time: datetime = self.now_utc()
         
-        # Perform initial load
+        # Track validation status
+        self._validation_stats = {
+            'services': {'valid': 0, 'invalid': 0},
+            'groups': {'valid': 0, 'invalid': 0},
+            'metrics': {'valid': 0, 'invalid': 0}
+        }
+        
+        # Load base config for logger setup
+        with open(self._source.config_path) as f:
+            base_config = yaml.safe_load(f) or {}
+        
+        # Set up initial logging config
+        self._config = self._merge_defaults(base_config)
+        self.logger = ProgramLogger(source, self).logger
+        
+        # Store initial exporter config
+        self._initial_exporter = deepcopy(self._config.get('exporter', {}))
+        
+        # Now perform full load with validation
         self.load(initial_load=True)
 
-    @staticmethod
-    def now_utc() -> datetime:
-        """Get current time in UTC."""
-        return datetime.now(timezone.utc)
+    def _merge_defaults(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge configuration with default values."""
+        result = deepcopy(self.DEFAULT_VALUES)
 
-    def get_uptime_seconds(self) -> float:
-        """Get service uptime in seconds."""
-        return (self.now_utc() - self._start_time).total_seconds()
+        # Only merge exporter section if present
+        if 'exporter' in config:
+            for key, value in config['exporter'].items():
+                if isinstance(value, dict) and key in result['exporter']:
+                    result['exporter'][key].update(value)
+                else:
+                    result['exporter'][key] = value
+        
+        # Services section is required and not defaulted
+        result['services'] = config.get('services', {})
+        
+        return result
 
-    @property
-    def exporter_user(self) -> str:
-        """Get configured exporter user."""
-        return self.exporter.get('user', 'prometheus')
-
-    @property
-    def running_under_systemd(self) -> bool:
-        """Whether the program is running under systemd."""
-        return self._running_under_systemd
-
-    @property
-    def collection_timeout(self) -> int:
-        """Collection timeout in seconds."""
-        return self.collection.get('collection_timeout_sec', 30)
-
-    @property
-    def exporter(self) -> Dict[str, Any]:
-        """Exporter configuration section."""
-        self._check_reload()
-        return self._config['exporter']
-    
-    @property
-    def services(self) -> Dict[str, Any]:
-        """Services configuration section."""
-        self._check_reload()
-        return self._config['services']
-
-    @property
-    def logging(self) -> Dict[str, Any]:
-        """Logging configuration section."""
-        return self.exporter.get('logging', {})
-
-    @property
-    def collection(self) -> Dict[str, Any]:
-        """Collection configuration section."""
-        return self.exporter.get('collection', {})
-    
-    @property
-    def metrics_port(self) -> int:
-        """Metrics server port."""
-        return self.exporter['metrics_port']
-    
-    @property
-    def health_port(self) -> int:
-        """Health check server port."""
-        return self.exporter['health_port']
-    
-    @property
-    def poll_interval(self) -> int:
-        """Collection polling interval."""
-        return self.collection.get('poll_interval_sec', 5)
-    
-    @property
-    def max_workers(self) -> int:
-        """Maximum parallel collection workers."""
-        return self.collection.get('max_workers', 4)
-    
-    @property
-    def failure_threshold(self) -> int:
-        """Failure threshold for health checking."""
-        return self.collection.get('failure_threshold', 20)
-
-    def get_service(self, name: str) -> Optional[Dict[str, Any]]:
-        """Get service configuration by name."""
-        return self.services.get(name)
+    def _reset_validation_stats(self):
+        """Reset validation statistics.
+        
+        Tracks success/failure counts for:
+        - Services: Total services validated
+        - Groups: Total metric groups across all services
+        - Metrics: Individual metrics across all groups
+        """
+        for section in self._validation_stats.values():
+            section['valid'] = 0
+            section['invalid'] = 0
 
     def load(self, initial_load: bool = False) -> None:
-        """Load configuration with thread safety."""
+        """Load configuration with thread safety and validation.
+
+        Handles two distinct cases:
+        1. Initial Load (initial_load=True):
+           - Full validation of all sections
+           - Failure raises MetricConfigurationError
+           - Stores initial exporter configuration
+        
+        2. Runtime Reload (initial_load=False):
+           - Ignores exporter section changes
+           - Optimistically validates services
+           - Maintains previous config on failures
+           - Provides detailed validation feedback
+        
+        Args:
+            initial_load: Whether this is the first configuration load
+            
+        Raises:
+            MetricConfigurationError: On initial load failures
+        """
         with self._lock:
             try:
+                self._reset_validation_stats()
+                
                 with open(self._source.config_path) as f:
                     config = yaml.safe_load(f)
                     if config is None:
                         raise MetricConfigurationError("Empty configuration file")
-
-                # Start with default values
-                validated = deepcopy(self.DEFAULT_VALUES)
                 
-                # Handle exporter section
-                if 'exporter' in config:
-                    if initial_load:
-                        # Store initial exporter config
-                        validated['exporter'].update(config['exporter'])
-                        self._initial_exporter = deepcopy(config['exporter'])
-                    else:
-                        # Compare with initial config
-                        current_exporter = config.get('exporter', {})
-                        if current_exporter != self._initial_exporter:
-                            changed_fields = [
-                                k for k, v in current_exporter.items()
-                                if self._initial_exporter.get(k) != v
-                            ]
-                            if changed_fields:
-                                self.logger.warning(
-                                    f"Changes detected in exporter section fields: {', '.join(changed_fields)}. "
-                                    "These changes will be ignored. Restart the service to apply changes."
-                                )
-                        # Keep current exporter config
-                        validated['exporter'] = deepcopy(self._config['exporter'])
-
-                # Handle services section
-                if 'services' not in config:
-                    raise MetricConfigurationError("Missing required 'services' section")
-
-                validated['services'] = {}
-                valid_services = 0
-                invalid_services = 0
+                # Keep previous config for rollback
+                previous_config = deepcopy(self._config)
                 
-                for service_name, service_config in config['services'].items():
-                    try:
-                        validated_service = self._validate_service(service_name, service_config)
-                        if validated_service:
-                            validated['services'][service_name] = validated_service
-                            valid_services += 1
-                        else:
-                            invalid_services += 1
-                    except Exception as e:
-                        self.logger.warning(
-                            f"Failed to validate service '{service_name}': {e}. "
-                            "Skipping this service but continuing with others."
-                        )
-                        invalid_services += 1
-
-                if valid_services == 0:
-                    if initial_load:
-                        raise MetricConfigurationError("No valid services found in initial configuration")
-                    self.logger.error(
-                        "No valid services found in new configuration. "
-                        "Keeping current service configuration."
-                    )
-                    validated['services'] = self._config['services']
-                elif invalid_services > 0:
-                    self.logger.warning(
-                        f"Partially valid configuration: {valid_services} valid services, "
-                        f"{invalid_services} invalid services"
+                try:
+                    # Start with default values
+                    validated = deepcopy(self.DEFAULT_VALUES)
+                    
+                    # Handle exporter section statically after initial load
+                    validated['exporter'] = self._validate_exporter(
+                        config.get('exporter', {}), 
+                        initial_load
                     )
 
-                # Update configuration
-                self._config = validated
-                self._last_load_time = self._source.config_path.stat().st_mtime
-                
-                self.logger.info(
-                    f"Configuration {'loaded' if initial_load else 'reloaded'} "
-                    f"successfully at {self.now_utc().isoformat()}"
-                )
+                    # Handle services section with optimistic parsing
+                    if 'services' not in config:
+                        raise MetricConfigurationError("Missing required 'services' section")
+                    
+                    validated['services'] = self._validate_services(
+                        config['services'],
+                        previous_config.get('services', {}) if not initial_load else {}
+                    )
+
+                    # Update configuration and timestamp
+                    self._config = validated
+                    self._last_load_time = self._source.config_path.stat().st_mtime
+                    
+                    # Log validation summary
+                    self._log_validation_summary(initial_load)
+                    
+                except Exception as e:
+                    if initial_load:
+                        raise
+                    self._config = previous_config
+                    self.logger.error(f"Failed to validate configuration: {e}")
+                    self.logger.info("Continuing with previous configuration")
 
             except Exception as e:
                 if initial_load:
@@ -433,26 +410,115 @@ class ProgramConfig:
                     "Continuing with previous configuration."
                 )
 
-    def _check_reload(self) -> None:
-        """Check if config file has been modified and reload if needed."""
-        try:
-            current_mtime = self._source.config_path.stat().st_mtime
-            if current_mtime > self._last_load_time:
-                self.load()
-        except Exception as e:
-            self.logger.error(f"Failed to check configuration reload: {e}")
+    def _validate_exporter(
+        self, 
+        exporter_config: Dict[str, Any],
+        initial_load: bool
+    ) -> Dict[str, Any]:
+        """Validate exporter section."""
+        if initial_load:
+            if not isinstance(exporter_config, dict):
+                raise MetricConfigurationError("Exporter section must be a dictionary")
+                
+            # Validate ports
+            metrics_port = exporter_config.get('metrics_port', 0)
+            health_port = exporter_config.get('health_port', 0)
+            
+            if not isinstance(metrics_port, int) or metrics_port < 1 or metrics_port > 65535:
+                raise MetricConfigurationError(
+                    f"Invalid metrics_port {metrics_port}: must be between 1-65535"
+                )
+                
+            if not isinstance(health_port, int) or health_port < 1 or health_port > 65535:
+                raise MetricConfigurationError(
+                    f"Invalid health_port {health_port}: must be between 1-65535"
+                )
+                
+            if metrics_port == health_port:
+                raise MetricConfigurationError(
+                    f"metrics_port ({metrics_port}) and health_port ({health_port}) "
+                    "must be different"
+                )
+            
+            return deepcopy(exporter_config)
+        else:
+            # Compare with initial config
+            if exporter_config != self._initial_exporter:
+                changed_fields = [
+                    k for k, v in exporter_config.items()
+                    if self._initial_exporter.get(k) != v
+                ]
+                if changed_fields:
+                    self.logger.warning(
+                        f"Changes detected in exporter section fields: {', '.join(changed_fields)}. "
+                        "These changes will be ignored. Restart the service to apply changes."
+                    )
+            # Always keep initial exporter config after first load
+            return deepcopy(self._initial_exporter)
+
+    def _validate_services(
+        self,
+        services_config: Dict[str, Any],
+        previous_services: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Validate services section with optimistic parsing."""
+        if not isinstance(services_config, dict):
+            raise MetricConfigurationError("Services section must be a dictionary")
+            
+        validated_services = {}
+        
+        for service_name, service_config in services_config.items():
+            try:
+                validated_service = self._validate_service(service_name, service_config)
+                if validated_service:
+                    validated_services[service_name] = validated_service
+                    self._validation_stats['services']['valid'] += 1
+                else:
+                    self._validation_stats['services']['invalid'] += 1
+            except Exception as e:
+                self._validation_stats['services']['invalid'] += 1
+                self.logger.warning(
+                    f"Failed to validate service '{service_name}': {e}. "
+                    "Skipping this service but continuing with others."
+                )
+
+        if not validated_services:
+            if previous_services:
+                self.logger.error(
+                    "No valid services found in new configuration. "
+                    "Keeping previous service configuration."
+                )
+                return previous_services
+            raise MetricConfigurationError("No valid services found in configuration")
+            
+        return validated_services
 
     def _validate_service(
         self,
         service_name: str,
         service_config: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        """Validate service configuration optimistically."""
+        """Validate service configuration optimistically.
+        
+        Attempts to validate and retain as much working configuration as possible.
+        Invalid components are skipped with warnings rather than failing completely.
+        
+        Args:
+            service_name: Name of service being validated
+            service_config: Raw service configuration dictionary
+        
+        Returns:
+            Validated service configuration or None if no valid components
+            
+        Validation Steps:
+        1. Validate basic service properties (description, run_as)
+        2. Validate each metric group independently
+        3. Track validation statistics for reporting
+        """
         if not isinstance(service_config, dict):
-            self.logger.warning(
-                f"Service '{service_name}' configuration must be a dictionary, got {type(service_config)}"
+            raise MetricConfigurationError(
+                f"Service '{service_name}' configuration must be a dictionary"
             )
-            return None
 
         validated = {}
         
@@ -463,8 +529,9 @@ class ProgramConfig:
 
         # Handle metric groups optimistically
         if 'metric_groups' not in service_config:
-            self.logger.warning(f"No metric groups defined for service '{service_name}'")
-            return None
+            raise MetricConfigurationError(
+                f"No metric groups defined for service '{service_name}'"
+            )
 
         validated['metric_groups'] = {}
         valid_groups = 0
@@ -480,28 +547,24 @@ class ProgramConfig:
                 if validated_group:
                     validated['metric_groups'][group_name] = validated_group
                     valid_groups += 1
+                    self._validation_stats['groups']['valid'] += 1
                 else:
                     invalid_groups += 1
+                    self._validation_stats['groups']['invalid'] += 1
             except Exception as e:
+                self._validation_stats['groups']['invalid'] += 1
                 self.logger.warning(
-                    f"Failed to validate metric group '{group_name}' in service '{service_name}': {e}"
+                    f"Failed to validate group '{group_name}' in service '{service_name}': {e}"
                 )
-                invalid_groups += 1
-                continue
 
+        # Return service if it has any valid groups
         if valid_groups > 0:
-            if invalid_groups > 0:
-                self.logger.warning(
-                    f"Service '{service_name}' partially valid: {valid_groups} valid groups, "
-                    f"{invalid_groups} invalid groups"
-                )
             return validated
-        else:
-            self.logger.warning(
-                f"Service '{service_name}' has no valid metric groups "
-                f"(attempted to parse {invalid_groups} groups)"
-            )
-            return None
+            
+        raise MetricConfigurationError(
+            f"No valid metric groups in service '{service_name}' "
+            f"(attempted to parse {invalid_groups} groups)"
+        )
 
     def _validate_metric_group(
         self,
@@ -511,29 +574,15 @@ class ProgramConfig:
     ) -> Optional[Dict[str, Any]]:
         """Validate metric group configuration optimistically."""
         if not isinstance(group_config, dict):
-            self.logger.warning(f"Metric group '{group_name}' configuration must be a dictionary")
-            return None
+            raise MetricConfigurationError("Must be a dictionary")
 
         validated = {}
         
-        # Copy group properties
-        for field in ['command', 'content_type', 'collection_frequency']:
-            if field in group_config:
-                validated[field] = group_config[field]
-
-        # Handle metrics optimistically
-        if 'metrics' not in group_config:
-            self.logger.warning(
-                f"No metrics defined in group '{group_name}' for service '{service_name}'"
-            )
-            return None
-
+        # First validate all metrics to determine if command is required
         validated['metrics'] = {}
-        valid_metrics = 0
-        invalid_metrics = 0
-        static_metrics = 0
+        static_metrics_only = True
         
-        for metric_name, metric_config in group_config['metrics'].items():
+        for metric_name, metric_config in group_config.get('metrics', {}).items():
             try:
                 validated_metric = self._validate_metric(
                     service_name,
@@ -542,39 +591,33 @@ class ProgramConfig:
                     metric_config
                 )
                 if validated_metric:
-                    if validated_metric.get('type') == 'static':
-                        static_metrics += 1
+                    if validated_metric.get('type') != 'static':
+                        static_metrics_only = False
                     validated['metrics'][metric_name] = validated_metric
-                    valid_metrics += 1
+                    self._validation_stats['metrics']['valid'] += 1
                 else:
-                    invalid_metrics += 1
+                    self._validation_stats['metrics']['invalid'] += 1
             except Exception as e:
+                self._validation_stats['metrics']['invalid'] += 1
                 self.logger.warning(
-                    f"Failed to validate metric '{metric_name}' in group '{group_name}': {e}"
+                    f"Failed to validate metric '{metric_name}': {e}"
                 )
-                invalid_metrics += 1
-                continue
 
-        # Validate we either have a command or all metrics are static
-        if 'command' not in validated and static_metrics < len(validated['metrics']):
-            self.logger.warning(
-                f"Metric group '{group_name}' missing command and has non-static metrics"
+        # Ensure we have required components
+        if not validated['metrics']:
+            raise MetricConfigurationError("No valid metrics defined")
+            
+        if not static_metrics_only and 'command' not in group_config:
+            raise MetricConfigurationError(
+                "Command required for non-static metrics"
             )
-            return None
 
-        if valid_metrics > 0:
-            if invalid_metrics > 0:
-                self.logger.warning(
-                    f"Metric group '{group_name}' partially valid: {valid_metrics} valid metrics, "
-                    f"{invalid_metrics} invalid metrics"
-                )
-            return validated
-        else:
-            self.logger.warning(
-                f"Metric group '{group_name}' has no valid metrics "
-                f"(attempted to parse {invalid_metrics} metrics)"
-            )
-            return None
+        # Copy group properties
+        for field in ['command', 'content_type', 'collection_frequency']:
+            if field in group_config:
+                validated[field] = group_config[field]
+
+        return validated
 
     def _validate_metric(
         self,
@@ -585,19 +628,16 @@ class ProgramConfig:
     ) -> Optional[Dict[str, Any]]:
         """Validate individual metric configuration."""
         if not isinstance(metric_config, dict):
-            self.logger.warning(f"Metric '{metric_name}' configuration must be a dictionary")
-            return None
+            raise MetricConfigurationError("Must be a dictionary")
 
         validated = {}
         
-        # Required fields
+        # Validate required fields
         if 'type' not in metric_config:
-            self.logger.warning(f"Metric '{metric_name}' missing required field: type")
-            return None
+            raise MetricConfigurationError("Missing required field: type")
             
         if 'description' not in metric_config:
-            self.logger.warning(f"Metric '{metric_name}' missing required field: description")
-            return None
+            raise MetricConfigurationError("Missing required field: description")
 
         validated['type'] = metric_config['type']
         validated['description'] = metric_config['description']
@@ -608,26 +648,23 @@ class ProgramConfig:
             
             if metric_type == MetricType.STATIC:
                 if 'value' not in metric_config:
-                    self.logger.warning(f"Static metric '{metric_name}' must specify a value")
-                    return None
+                    raise MetricConfigurationError("Static metric must specify a value")
                     
                 try:
                     validated['value'] = float(metric_config['value'])
                 except (TypeError, ValueError):
-                    self.logger.warning(
-                        f"Static metric '{metric_name}' has invalid value: {metric_config['value']}"
+                    raise MetricConfigurationError(
+                        f"Invalid static value: {metric_config['value']}"
                     )
-                    return None
                     
             else:  # gauge or counter
                 if 'filter' not in metric_config:
-                    self.logger.warning(
-                        f"{metric_type.value} metric '{metric_name}' must specify a filter"
+                    raise MetricConfigurationError(
+                        f"{metric_type.value} metric must specify a filter"
                     )
-                    return None
                 validated['filter'] = metric_config['filter']
 
-            # Optional fields
+            # Copy optional fields
             for field in ['content_type', 'value_on_error', 'collection_frequency']:
                 if field in metric_config:
                     validated[field] = metric_config[field]
@@ -635,8 +672,121 @@ class ProgramConfig:
             return validated
 
         except Exception as e:
-            self.logger.warning(f"Failed to validate metric '{metric_name}': {e}")
-            return None
+            raise MetricConfigurationError(f"Invalid metric configuration: {e}")
+
+    def _log_validation_summary(self, initial_load: bool) -> None:
+        """Log validation statistics summary.
+        
+        Provides detailed feedback about configuration validation:
+        - Total services/groups/metrics validated
+        - Success/failure counts at each level
+        - Clear warnings about any validation issues
+        - Differentiated messages for initial load vs reload
+        
+        Args:
+            initial_load: Whether this is the first configuration load
+        """
+        stats = self._validation_stats
+        
+        # Calculate totals
+        total_services = stats['services']['valid'] + stats['services']['invalid']
+        total_groups = stats['groups']['valid'] + stats['groups']['invalid']
+        total_metrics = stats['metrics']['valid'] + stats['metrics']['invalid']
+        
+        if initial_load:
+            self.logger.info(
+                f"Initial configuration loaded with "
+                f"{stats['services']['valid']}/{total_services} services, "
+                f"{stats['groups']['valid']}/{total_groups} groups, "
+                f"{stats['metrics']['valid']}/{total_metrics} metrics valid"
+            )
+        else:
+            if stats['services']['invalid'] > 0 or stats['groups']['invalid'] > 0:
+                self.logger.warning(
+                    f"Configuration reloaded with validation issues: "
+                    f"{stats['services']['invalid']} invalid services, "
+                    f"{stats['groups']['invalid']} invalid groups, "
+                    f"{stats['metrics']['invalid']} invalid metrics"
+                )
+            else:
+                self.logger.info(
+                    f"Configuration reloaded successfully with "
+                    f"{stats['services']['valid']} services, "
+                    f"{stats['groups']['valid']} groups, "
+                    f"{stats['metrics']['valid']} metrics"
+                )
+
+    def _check_reload(self) -> None:
+        """Check if config file has been modified and reload if needed."""
+        try:
+            current_mtime = self._source.config_path.stat().st_mtime
+            if current_mtime > self._last_load_time:
+                self.load()
+        except Exception as e:
+            self.logger.error(f"Failed to check configuration reload: {e}")
+
+    # Standard properties from original implementation
+    @staticmethod
+    def now_utc() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def get_uptime_seconds(self) -> float:
+        return (self.now_utc() - self._start_time).total_seconds()
+
+    @property
+    def exporter_user(self) -> str:
+        return self.exporter.get('user', 'prometheus')
+
+    @property
+    def running_under_systemd(self) -> bool:
+        return self._running_under_systemd
+
+    @property
+    def collection_timeout(self) -> int:
+        return self.collection.get('collection_timeout_sec', 30)
+
+    @property
+    def exporter(self) -> Dict[str, Any]:
+        self._check_reload()
+        return self._config['exporter']
+    
+    @property
+    def services(self) -> Dict[str, Any]:
+        self._check_reload()
+        return self._config['services']
+
+    @property
+    def logging(self) -> Dict[str, Any]:
+        return self.exporter.get('logging', {})
+
+    @property
+    def collection(self) -> Dict[str, Any]:
+        return self.exporter.get('collection', {})
+    
+    @property
+    def metrics_port(self) -> int:
+        return self.exporter['metrics_port']
+    
+    @property
+    def health_port(self) -> int:
+        return self.exporter['health_port']
+    
+    @property
+    def poll_interval(self) -> int:
+        return self.collection.get('poll_interval_sec', 5)
+    
+    @property
+    def max_workers(self) -> int:
+        return self.collection.get('max_workers', 4)
+    
+    @property
+    def failure_threshold(self) -> int:
+        return self.collection.get('failure_threshold', 20)
+
+    def get_service(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get service configuration by name."""
+        self._check_reload()
+        return self.services.get(name)
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
