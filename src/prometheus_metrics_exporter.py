@@ -316,16 +316,22 @@ class ProgramConfig:
         """Merge configuration with default values."""
         result = deepcopy(self.DEFAULT_VALUES)
 
-        # Only merge exporter section if present
+        # Ensure logging defaults are preserved
         if 'exporter' in config:
+            if 'logging' in config['exporter']:
+                result['exporter']['logging'] = self._merge_dicts(
+                    result['exporter']['logging'],
+                    config['exporter']['logging']
+                )
             for key, value in config['exporter'].items():
-                if isinstance(value, dict) and key in result['exporter']:
-                    result['exporter'][key] = self._merge_dicts(
-                        result['exporter'][key],
-                        value
-                    )
-                else:
-                    result['exporter'][key] = deepcopy(value)
+                if key != 'logging':  # Skip logging as we handled it above
+                    if isinstance(value, dict) and key in result['exporter']:
+                        result['exporter'][key] = self._merge_dicts(
+                            result['exporter'][key],
+                            value
+                        )
+                    else:
+                        result['exporter'][key] = deepcopy(value)
         
         # Services section is required and not defaulted
         result['services'] = config.get('services', {})
