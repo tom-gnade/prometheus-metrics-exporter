@@ -1701,6 +1701,10 @@ class MetricsCollector:
             
             if value is not None:
                 metric = self._prometheus_metrics[identifier]
+
+                # Track collection time for this metric
+                self._last_collection_times[identifier] = self.config.now_utc()
+
                 if identifier.type == MetricType.COUNTER:
                     prev_value = self._previous_values.get(identifier, 0)
                     if value > prev_value:
@@ -1708,9 +1712,6 @@ class MetricsCollector:
                     self._previous_values[identifier] = value
                 else:
                     metric.set(value)
-
-                # Track collection time for this metric
-                self._last_collection_times[identifier] = self.config.now_utc()
 
                 # Update timestamp metric for this metric
                 timestamp_metric_name = f"{identifier.prometheus_name}_last_collected_unix_seconds"
