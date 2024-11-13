@@ -1462,7 +1462,7 @@ class ServiceMetricsCollector:
             except Exception as e:
                 self.logger.error(f"Failed to initialize user context for {service_name}: {e}")
     
-async def collect_metrics(self) -> Dict[MetricIdentifier, float]:
+    async def collect_metrics(self) -> Dict[MetricIdentifier, float]:
         """Collect all metrics for this service."""
         results = {}
         self.logger.info(f"Starting metrics collection for service: {self.service_name}")
