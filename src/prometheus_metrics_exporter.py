@@ -472,110 +472,106 @@ class ProgramConfig:
         return validated
 
     def _validate_metric_group(
-        self,
-        service_name: str,
-        group_name: str,
-        group_config: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Validate metric group configuration."""
-        if not isinstance(group_config, dict):
-            raise MetricConfigurationError("Must be a dictionary")
+            self,
+            service_name: str,
+            group_name: str,
+            group_config: Dict[str, Any]
+        ) -> Optional[Dict[str, Any]]:
+            """Validate metric group configuration."""
+            if not isinstance(group_config, dict):
+                raise MetricConfigurationError("Must be a dictionary")
 
-        validated = {}
-        
-        # Validate metrics first to determine if command is required
-        validated['metrics'] = {}
-        static_metrics_only = True
-        
-        for metric_name, metric_config in group_config.get('metrics', {}).items():
-            try:
-                validated_metric = self._validate_metric(
-                    service_name,
-                    group_name,
-                    metric_name,
-                    metric_config
-                )
-                if validated_metric:
-                    if validated_metric.get('type') != 'static':
-                        static_metrics_only = False
-                    validated['metrics'][metric_name] = validated_metric
-                    self._validation_stats['metrics']['valid'] += 1
-                else:
-                    self._validation_stats['metrics']['invalid'] += 1
-            except Exception as e:
-                self._validation_stats['metrics']['invalid'] += 1
-                if self.logger:
-                    self.logger.warning(
-                        f"Failed to validate metric '{metric_name}': {e}"
-                    )
-
-        if not validated['metrics']:
-            raise MetricConfigurationError("No valid metrics defined")
+            validated = {}
             
-        if not static_metrics_only and 'command' not in group_config:
-            raise MetricConfigurationError("Command required for non-static metrics")
-
-        # Copy group properties
-        for field in ['command', 'content_type', 'collection_frequency']:
-            if field in group_config:
-                validated[field] = group_config[field]
-
-        return validated
-
-    def _validate_metric(
-        self,
-        service_name: str,
-        group_name: str,
-        metric_name: str,
-        metric_config: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Validate individual metric configuration."""
-        if not isinstance(metric_config, dict):
-            raise MetricConfigurationError("Must be a dictionary")
-
-        validated = {}
-        
-        # Validate required fields
-        if 'type' not in metric_config:
-            raise MetricConfigurationError("Missing required field: type")
+            # Validate metrics first to determine if command is required
+            validated['metrics'] = {}
+            static_metrics_only = True
             
-        if 'description' not in metric_config:
-            raise MetricConfigurationError("Missing required field: description")
-
-        validated['type'] = metric_config['type']
-        validated['description'] = metric_config['description']
-
-        # Type-specific validation
-        try:
-            metric_type = MetricType.from_config(metric_config)
-            
-            if metric_type == MetricType.STATIC:
-                if 'value' not in metric_config:
-                    raise MetricConfigurationError("Static metric must specify a value")
-                    
+            for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    validated['value'] = float(metric_config['value'])
-                except (TypeError, ValueError):
-                    raise MetricConfigurationError(
-                        f"Invalid static value: {metric_config['value']}"
+                    validated_metric = self._validate_metric(
+                        service_name,
+                        group_name,
+                        metric_name,
+                        metric_config
                     )
-                    
-            else:  # gauge or counter
-                if 'filter' not in metric_config:
-                    raise MetricConfigurationError(
-                        f"{metric_type.value} metric must specify a filter"
-                    )
-                validated['filter'] = metric_config['filter']
+                    if validated_metric:
+                        if validated_metric.get('type') != 'static':
+                            static_metrics_only = False
+                        validated['metrics'][metric_name] = validated_metric
+                        self._validation_stats['metrics']['valid'] += 1
+                    else:
+                        self._validation_stats['metrics']['invalid'] += 1
+                except Exception as e:
+                    self._validation_stats['metrics']['invalid'] += 1
+                    if self.logger:
+                        self.logger.warning(
+                            f"Failed to validate metric '{metric_name}': {e}"
+                        )
 
-            # Copy optional fields
-            for field in ['content_type', 'value_on_error', 'collection_frequency']:
-                if field in metric_config:
-                    validated[field] = metric_config[field]
+            if not validated['metrics']:
+                raise MetricConfigurationError("No valid metrics defined")
+                
+            # Changed this condition - command is optional if we have static metrics
+            if 'command' in group_config:
+                validated['command'] = group_config['command']
+            elif not static_metrics_only:
+                raise MetricConfigurationError("Command required when group has non-static metrics")
+
+            # Copy group properties
+            for field in ['content_type', 'collection_frequency']:
+                if field in group_config:
+                    validated[field] = group_config[field]
 
             return validated
 
-        except Exception as e:
-            raise MetricConfigurationError(f"Invalid metric configuration: {e}")
+    def _validate_metric(
+            self,
+            service_name: str,
+            group_name: str,
+            metric_name: str,
+            metric_config: Dict[str, Any]
+        ) -> Optional[Dict[str, Any]]:
+            """Validate individual metric configuration."""
+            if not isinstance(metric_config, dict):
+                raise MetricConfigurationError("Must be a dictionary")
+
+            validated = {}
+            
+            # Validate required fields
+            if 'type' not in metric_config:
+                raise MetricConfigurationError("Missing required field: type")
+                
+            if 'description' not in metric_config:
+                raise MetricConfigurationError("Missing required field: description")
+
+            validated['type'] = metric_config['type']
+            validated['description'] = metric_config['description']
+
+            # Type-specific validation
+            try:
+                metric_type = MetricType.from_config(metric_config)
+                
+                if metric_type == MetricType.STATIC:
+                    if 'value' not in metric_config:
+                        raise MetricConfigurationError("Static metric must specify a value")
+                    validated['value'] = float(metric_config['value'])
+                else:  # gauge or counter
+                    if 'filter' not in metric_config:
+                        raise MetricConfigurationError(
+                            f"{metric_type.value} metric must specify a filter"
+                        )
+                    validated['filter'] = metric_config['filter']
+
+                # Copy optional fields
+                for field in ['content_type', 'value_on_error', 'collection_frequency']:
+                    if field in metric_config:
+                        validated[field] = metric_config[field]
+
+                return validated
+
+            except Exception as e:
+                raise MetricConfigurationError(f"Invalid metric configuration: {e}")
 
     def _log_validation_summary(self, initial_load: bool) -> None:
         """Log validation statistics summary."""
@@ -1911,58 +1907,63 @@ class HealthCheck:
         return app
 
     def _get_metrics_inventory(self) -> Dict[str, Any]:
-        """Get metrics inventory with collection status."""
-        metrics_info = {}
-        last_collections = self.metrics_collector._last_collection_times
-        
-        for service_name, service_config in self.config.services.items():
-            service_info = {
-                "description": service_config.get("description", ""),
-                "run_as": service_config.get("run_as"),
-                "metric_groups": {}
-            }
+            """Get metrics inventory with collection status."""
+            metrics_info = {}
+            last_collections = self.metrics_collector._last_collection_times
+            services_config = self.config.services  # Using validated config
             
-            for group_name, group_config in service_config.get("metric_groups", {}).items():
-                group_info = {
-                    "command": group_config.get("command", ""),
-                    "metrics": {}
+            for service_name, service_config in services_config.items():
+                service_info = {
+                    "description": service_config.get("description", ""),
+                    "run_as": service_config.get("run_as"),
+                    "metric_groups": {}
                 }
                 
-                for metric_name, metric_config in group_config.get("metrics", {}).items():
-                    metric_type = MetricType.from_config(metric_config)
-                    identifier = MetricIdentifier(
-                        service=service_name,
-                        group=group_name,
-                        name=metric_name,
-                        type=metric_type,
-                        description=metric_config.get("description", "")
-                    )
-                    
-                    last_collection = last_collections.get(identifier)
-                    metric_info = {
-                        "type": metric_type.value,
-                        "description": metric_config.get("description", ""),
-                        "prometheus_name": identifier.prometheus_name,
-                        "last_collection_utc": (
-                            last_collection.isoformat() if last_collection else None
-                        ),
-                        "settings": {
-                            "content_type": metric_config.get("content_type", "text"),
-                            "filter": metric_config.get("filter"),
-                            "value_on_error": metric_config.get("value_on_error")
-                        }
+                for group_name, group_config in service_config.get("metric_groups", {}).items():
+                    group_info = {
+                        "command": group_config.get("command", ""),
+                        "metrics": {}
                     }
                     
-                    if metric_type == MetricType.STATIC:
-                        metric_info["settings"]["value"] = metric_config.get("value")
+                    for metric_name, metric_config in group_config.get("metrics", {}).items():
+                        metric_type = MetricType.from_config(metric_config)
+                        identifier = MetricIdentifier(
+                            service=service_name,
+                            group=group_name,
+                            name=metric_name,
+                            type=metric_type,
+                            description=metric_config.get("description", "")
+                        )
+                        
+                        # Only include metrics that have been validated and are being collected
+                        if identifier in self.metrics_collector._prometheus_metrics:
+                            last_collection = last_collections.get(identifier)
+                            metric_info = {
+                                "type": metric_type.value,
+                                "description": metric_config.get("description", ""),
+                                "prometheus_name": identifier.prometheus_name,
+                                "last_collection_utc": (
+                                    last_collection.isoformat() if last_collection else None
+                                ),
+                                "settings": {
+                                    "content_type": metric_config.get("content_type", "text"),
+                                    "filter": metric_config.get("filter"),
+                                    "value_on_error": metric_config.get("value_on_error")
+                                }
+                            }
+                            
+                            if metric_type == MetricType.STATIC:
+                                metric_info["settings"]["value"] = metric_config.get("value")
+                            
+                            group_info["metrics"][metric_name] = metric_info
                     
-                    group_info["metrics"][metric_name] = metric_info
+                    if group_info["metrics"]:  # Only include groups with valid metrics
+                        service_info["metric_groups"][group_name] = group_info
                 
-                service_info["metric_groups"][group_name] = group_info
+                if service_info["metric_groups"]:  # Only include services with valid groups
+                    metrics_info[service_name] = service_info
             
-            metrics_info[service_name] = service_info
-        
-        return metrics_info
+            return metrics_info
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Main Service Class and Entry Point
