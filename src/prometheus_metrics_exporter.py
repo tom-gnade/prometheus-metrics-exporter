@@ -154,6 +154,7 @@ import yaml
 VERBOSE_DEBUG = False
 VERBOSE_LEVEL = 15  # DEBUG 10, INFO 20
 logging.addLevelName(VERBOSE_LEVEL, 'VERBOSE')
+
 class VerboseLogger(logging.Logger):
     """Enhanced Logger class adding development-only verbose debugging capabilities
     
@@ -170,21 +171,22 @@ class VerboseLogger(logging.Logger):
         **kwargs: Any
     ) -> None:
         """Log verbose debug messages with efficient deferred evaluation."""
-        if not self.VERBOSE_DEBUG:
+        global VERBOSE_DEBUG
+        if not VERBOSE_DEBUG:
             return
 
         # Handle deferred evaluation of expensive computations
         if callable(msg):
             if args or kwargs:
-                self.log(self.VERBOSE_LEVEL, msg(*args, **kwargs))
+                self.log(VERBOSE_LEVEL, msg(*args, **kwargs))
             else:
-                self.log(self.VERBOSE_LEVEL, msg())
+                self.log(VERBOSE_LEVEL, msg())
         # Handle string formatting
         elif args or kwargs:
-            self.log(self.VERBOSE_LEVEL, msg.format(*args, **kwargs))
+            self.log(VERBOSE_LEVEL, msg.format(*args, **kwargs))
         # Handle simple strings
         else:
-            self.log(self.VERBOSE_LEVEL, msg)
+            self.log(VERBOSE_LEVEL, msg)
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Core Exceptions
