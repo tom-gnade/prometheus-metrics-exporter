@@ -2312,7 +2312,7 @@ class MetricsExporter:
             self.logger.info("Service shutdown complete")
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
-
+ 
 async def main():
     """Entry point for the metrics exporter service."""
     exporter = None
