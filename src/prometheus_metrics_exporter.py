@@ -1691,7 +1691,7 @@ class MetricsCollector:
         try:
             # Debug log the collection attempt
             self.logger.debug(f"Starting metrics collection with {len(self.service_collectors)} collectors")
-
+            
             # Update uptime metric
             self._internal_metrics['uptime'].set(self.config.get_uptime_seconds())
             
@@ -1702,25 +1702,33 @@ class MetricsCollector:
             
             # Debug log the raw results
             self.logger.debug(f"Raw collection results: {service_results}")
-
+            
             # Process results from each service
             for service_name, metrics in service_results.items():
                 self.logger.debug(f"Processing results for service {service_name}: {metrics}")
-                if isinstance(metrics, Dict) and metrics:  # Check if we got any metrics
+                if isinstance(metrics, Dict) and metrics:
                     success_count += len(metrics)
+                    # Update Prometheus metrics with the collected values
                     self._update_prometheus_metrics(metrics)
                 else:
                     self.logger.error(f"Failed to collect metrics for {service_name}")
                     errors += 1
             
-            self.logger.debug(f"Current Prometheus metrics: {[m.name for m in self._prometheus_metrics.values()]}")
-
+            # Debug log final metrics state
+            metric_names = []
+            for identifier, metric in self._prometheus_metrics.items():
+                try:
+                    metric_names.append(identifier.prometheus_name)
+                except Exception as e:
+                    self.logger.error(f"Error getting metric info: {e}")
+            self.logger.debug(f"Current Prometheus metrics: {metric_names}")
+            
             # Update statistics
             collection_time = self.config.now_utc().timestamp() - collection_start
             self.stats.successful += success_count
             self.stats.errors += errors
             
-            if success_count == 0:  # If no metrics were collected successfully
+            if success_count == 0:
                 self.stats.consecutive_failures += 1
             else:
                 self.stats.consecutive_failures = 0
@@ -1744,7 +1752,7 @@ class MetricsCollector:
             return success_count > 0
             
         except Exception as e:
-            self.logger.error(f"Failed to collect metrics: {e}")
+            self.logger.error(f"Failed to collect metrics: {e}", exc_info=True)
             return False
     
     def _create_prometheus_metric(
@@ -1809,9 +1817,6 @@ class MetricsCollector:
                         
             except Exception as e:
                 self.logger.error(f"Failed to update metric {identifier.prometheus_name}: {e}")
-
-        # Log final metrics state
-        self.logger.info(f"Current Prometheus metrics: {[m.name for m in self._prometheus_metrics.values()]}")
 
     def _update_internal_metrics(self, successes: int, errors: int, duration: float):
         """Update internal metrics."""
