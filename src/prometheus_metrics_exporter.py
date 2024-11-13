@@ -1725,8 +1725,14 @@ class MetricsCollector:
         """Update Prometheus metrics with collected values."""
         collection_time = round(self.config.now_utc().timestamp(), 3)
         
+        # Sort metrics by service, group, and metric name
+        sorted_metrics = sorted(
+            metrics.items(),
+            key=lambda x: (x[0].service, x[0].group, x[0].name)
+        )
+        
         self.logger.info(f"Updating Prometheus metrics with {len(metrics)} metrics")
-        for identifier, value in metrics.items():
+        for identifier, value in sorted_metrics:
             try:
                 metric_name = identifier.prometheus_name
                 self.logger.debug(f"Processing metric: {metric_name} = {value}")
