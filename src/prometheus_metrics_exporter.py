@@ -722,9 +722,15 @@ class ProgramLogger:
         log_path = self.source.script_dir / f"{self.source.base_name}.log"
         if not log_path.exists():
             user_context = UserContext(self.config.exporter_user, None)
-            with user_context.temp_context():
+            try:
+                with user_context.temp_context():
+                    log_path.touch()
+                    # Ensure mode is 0o644 (rw-r--r--)
+                    log_path.chmod(0o644)
+            except Exception as e:
+                print(f"Failed to create log file as {self.config.exporter_user}: {e}", file=sys.stderr)
+                # Fallback to creating as current user
                 log_path.touch()
-                # Ensure mode is 0o644 (rw-r--r--)
                 log_path.chmod(0o644)
         
         self._logger = self._setup_logging()
@@ -1210,22 +1216,25 @@ class UserContext:
             self.user_info = pwd.getpwnam(self.username)
             self.group_info = grp.getgrgid(self.user_info.pw_gid)
         except KeyError as e:
-            self.logger.error(f"Invalid user or group: {e}")
+            if self.logger:
+                self.logger.error(f"Invalid user or group: {e}")
             self._enabled = False
     
     @contextmanager
     def temp_context(self):
         """Temporarily switch user context if running as root."""
         if not self._enabled:
-            self.logger.warning(
-                f"User switching disabled (not running as root). "
-                f"Commands will run as current user."
-            )
+            if self.logger:
+                self.logger.warning(
+                    f"User switching disabled (not running as root). "
+                    f"Commands will run as current user."
+                )
             yield
             return
 
         try:
-            self.logger.debug(f"Switching to user {self.username} (uid={self.user_info.pw_uid})")
+            if self.logger:
+                self.logger.debug(f"Switching to user {self.username} (uid={self.user_info.pw_uid})")
             
             os.setegid(self.group_info.gr_gid)
             os.seteuid(self.user_info.pw_uid)
@@ -1235,12 +1244,12 @@ class UserContext:
             finally:
                 os.seteuid(self._original_uid)
                 os.setegid(self._original_gid)
-                self.logger.debug(f"Restored original user (uid={self._original_uid})")
+                if self.logger:
+                    self.logger.debug(f"Restored original user (uid={self._original_uid})")
                 
         except Exception as e:
-            self.logger.error(
-                f"Failed to switch to user {self.username}: {e}"
-            )
+            if self.logger:
+                self.logger.error(f"Failed to switch to user {self.username}: {e}")
             raise
         
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
