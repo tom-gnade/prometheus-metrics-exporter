@@ -356,17 +356,29 @@ class ProgramConfig:
                 new_config['services'] = self._validate_services(file_config['services'])
 
                 # Update configuration
+                old_config = self._config
                 self._config = new_config
                 self._last_load_time = self._source.config_path.stat().st_mtime
                 
                 # Log validation summary
                 self._log_validation_summary(initial_load)
 
+                # If this is a reload (not initial load) and the services changed,
+                # notify any registered callbacks
+                if not initial_load and old_config.get('services') != new_config['services']:
+                    if hasattr(self, 'on_config_reload') and self.on_config_reload:
+                        self.logger.info("Services configuration changed, triggering reload callback")
+                        self.on_config_reload()
+
             except Exception as e:
                 if initial_load:
                     raise MetricConfigurationError(f"Failed to load initial config: {e}")
                 if self.logger:
                     self.logger.error(f"Failed to reload configuration: {e}")
+
+    def register_reload_callback(self, callback: callable) -> None:
+        """Register a callback to be called when configuration is reloaded."""
+        self.on_config_reload = callback
 
     def _merge_with_defaults(self, defaults: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
         """Simple merge of override values with defaults."""
@@ -1630,12 +1642,14 @@ class MetricsCollector:
         self.logger = logger
         self.stats = CollectionStats()
         self.service_collectors: Dict[str, ServiceMetricsCollector] = {}
-        # Split into two dictionaries - one for main metrics, one for timestamps
         self._prometheus_metrics: Dict[MetricIdentifier, Union[Gauge, Counter]] = {}
         self._timestamp_metrics: Dict[str, Gauge] = {}
         self._previous_values: Dict[MetricIdentifier, float] = {}
         self._last_collection_times: Dict[MetricIdentifier, datetime] = {}
         self.collection_manager = CollectionManager(config, logger)
+        
+        # Register for config reload notifications
+        self.config.register_reload_callback(self._reinitialize_collectors)
         
         self._initialize_collectors()
         self._setup_internal_metrics()
@@ -1679,6 +1693,12 @@ class MetricsCollector:
                 'Unix timestamp of last successful metrics collection with millisecond precision'
             )
         }
+
+    def _reinitialize_collectors(self):
+        """Reinitialize collectors after config reload."""
+        self.logger.info("Reinitializing collectors due to configuration change")
+        self.service_collectors.clear()  # Clear existing collectors
+        self._initialize_collectors()    # Create new ones with updated config
 
     def _create_prometheus_metric(
         self,
