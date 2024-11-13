@@ -1665,38 +1665,38 @@ class MetricsCollector:
             return Counter(identifier.prometheus_name, identifier.description)
         return Gauge(identifier.prometheus_name, identifier.description)
 
-def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
-    """Update Prometheus metrics with collected values."""
-    collection_time = round(self.config.now_utc().timestamp(), 3)
+    def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
+        """Update Prometheus metrics with collected values."""
+        collection_time = round(self.config.now_utc().timestamp(), 3)
 
-    for identifier, value in metrics.items():
-        # Always create the metric if it doesn't exist, regardless of type
-        if identifier not in self._prometheus_metrics:
-            self._prometheus_metrics[identifier] = self._create_prometheus_metric(identifier)
-        
-        # For ALL metrics (including static), update if we have a value
-        if value is not None:
-            metric = self._prometheus_metrics[identifier]
-            # Update collection time FIRST for all metrics
-            self._last_collection_times[identifier] = self.config.now_utc()
+        for identifier, value in metrics.items():
+            # Always create the metric if it doesn't exist, regardless of type
+            if identifier not in self._prometheus_metrics:
+                self._prometheus_metrics[identifier] = self._create_prometheus_metric(identifier)
+            
+            # For ALL metrics (including static), update if we have a value
+            if value is not None:
+                metric = self._prometheus_metrics[identifier]
+                # Update collection time FIRST for all metrics
+                self._last_collection_times[identifier] = self.config.now_utc()
 
-            # Set the value based on type
-            if identifier.type == MetricType.COUNTER:
-                prev_value = self._previous_values.get(identifier, 0)
-                if value > prev_value:
-                    metric.inc(value - prev_value)
-                self._previous_values[identifier] = value
-            else:  # Both GAUGE and STATIC get set directly
-                metric.set(value)
+                # Set the value based on type
+                if identifier.type == MetricType.COUNTER:
+                    prev_value = self._previous_values.get(identifier, 0)
+                    if value > prev_value:
+                        metric.inc(value - prev_value)
+                    self._previous_values[identifier] = value
+                else:  # Both GAUGE and STATIC get set directly
+                    metric.set(value)
 
-            # Always update timestamp metric
-            timestamp_metric_name = f"{identifier.prometheus_name}_last_collected_unix_seconds"
-            if timestamp_metric_name not in self._prometheus_metrics:
-                self._prometheus_metrics[timestamp_metric_name] = Gauge(
-                    timestamp_metric_name,
-                    f"Unix timestamp when {identifier.prometheus_name} was last collected"
-                )
-            self._prometheus_metrics[timestamp_metric_name].set(collection_time)
+                # Always update timestamp metric
+                timestamp_metric_name = f"{identifier.prometheus_name}_last_collected_unix_seconds"
+                if timestamp_metric_name not in self._prometheus_metrics:
+                    self._prometheus_metrics[timestamp_metric_name] = Gauge(
+                        timestamp_metric_name,
+                        f"Unix timestamp when {identifier.prometheus_name} was last collected"
+                    )
+                self._prometheus_metrics[timestamp_metric_name].set(collection_time)
 
     def _update_internal_metrics(self, successes: int, errors: int, duration: float):
         """Update internal metrics."""
