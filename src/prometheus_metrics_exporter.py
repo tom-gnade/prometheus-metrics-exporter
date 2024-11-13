@@ -1401,7 +1401,7 @@ class ServiceMetricsCollector:
             except Exception as e:
                 self.logger.error(f"Failed to initialize user context for {service_name}: {e}")
     
-    async def collect_metrics(self) -> Dict[MetricIdentifier, float]:
+async def collect_metrics(self) -> Dict[MetricIdentifier, float]:
         """Collect all metrics for this service."""
         results = {}
         self.logger.debug(f"Starting metrics collection for service: {self.service_name}")
@@ -1416,6 +1416,8 @@ class ServiceMetricsCollector:
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
                     metric_type = MetricType.from_config(metric_config)
+                    self.logger.debug(f"Checking metric {metric_name}, type: {metric_type}")
+                    
                     if metric_type == MetricType.STATIC:
                         identifier = MetricIdentifier(
                             service=self.service_name,
@@ -1426,9 +1428,9 @@ class ServiceMetricsCollector:
                         )
                         value = float(metric_config.get('value', 0))
                         results[identifier] = value
-                        self.logger.debug(f"Added static metric {metric_name} = {value}")
+                        self.logger.debug(f"Added static metric to results: {identifier.prometheus_name} = {value}")
                 except Exception as e:
-                    self.logger.error(f"Failed to process static metric {metric_name}: {e}")
+                    self.logger.error(f"Failed to process static metric {metric_name}: {e}", exc_info=True)
             
             # Then handle dynamic metrics that need command execution
             try:
@@ -1439,7 +1441,7 @@ class ServiceMetricsCollector:
             except Exception as e:
                 self.logger.error(f"Failed to collect metric group {group_name}: {e}")
         
-        self.logger.debug(f"Service {self.service_name} collection completed. Results: {results}")
+        self.logger.debug(f"Service {self.service_name} final results: {results}")
         return results
     
     async def collect_group(
@@ -1680,28 +1682,31 @@ class MetricsCollector:
     def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
         """Update Prometheus metrics with collected values."""
         collection_time = round(self.config.now_utc().timestamp(), 3)
-
+        
+        self.logger.debug(f"Updating Prometheus metrics with {len(metrics)} metrics")
         for identifier, value in metrics.items():
-            # Always create the metric if it doesn't exist, regardless of type
+            self.logger.debug(f"Processing metric: {identifier.prometheus_name} ({identifier.type.value}) = {value}")
+            
+            # Always create the metric if it doesn't exist
             if identifier not in self._prometheus_metrics:
+                self.logger.debug(f"Creating new Prometheus metric for {identifier.prometheus_name}")
                 self._prometheus_metrics[identifier] = self._create_prometheus_metric(identifier)
             
-            # For ALL metrics (including static), update if we have a value
             if value is not None:
                 metric = self._prometheus_metrics[identifier]
-                # Update collection time FIRST for all metrics
                 self._last_collection_times[identifier] = self.config.now_utc()
-
-                # Set the value based on type
+                
                 if identifier.type == MetricType.COUNTER:
                     prev_value = self._previous_values.get(identifier, 0)
                     if value > prev_value:
                         metric.inc(value - prev_value)
                     self._previous_values[identifier] = value
+                    self.logger.debug(f"Updated counter {identifier.prometheus_name} to {value}")
                 else:  # Both GAUGE and STATIC get set directly
                     metric.set(value)
+                    self.logger.debug(f"Set {identifier.prometheus_name} to {value}")
 
-                # Always update timestamp metric
+                # Update timestamp metric
                 timestamp_metric_name = f"{identifier.prometheus_name}_last_collected_unix_seconds"
                 if timestamp_metric_name not in self._prometheus_metrics:
                     self._prometheus_metrics[timestamp_metric_name] = Gauge(
@@ -1709,6 +1714,7 @@ class MetricsCollector:
                         f"Unix timestamp when {identifier.prometheus_name} was last collected"
                     )
                 self._prometheus_metrics[timestamp_metric_name].set(collection_time)
+                self.logger.debug(f"Updated timestamp for {identifier.prometheus_name}")
 
     def _update_internal_metrics(self, successes: int, errors: int, duration: float):
         """Update internal metrics."""
