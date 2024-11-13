@@ -1502,7 +1502,7 @@ class ServiceMetricsCollector:
         self.logger.debug(f"Service {self.service_name} final collection results: {results}")
         return results
     
-    async def collect_group(
+async def collect_group(
         self,
         group_name: str,
         group_config: Dict
@@ -1535,7 +1535,7 @@ class ServiceMetricsCollector:
             # Parse metrics from command output
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    metric_type = MetricType.from_config(metric_config)
+                    metric_type = MetricType.from_config(metric_config)  # Get the type once
                     identifier = MetricIdentifier(
                         service=self.service_name,
                         group=group_name,
@@ -1545,7 +1545,7 @@ class ServiceMetricsCollector:
                         description=metric_config['description']
                     )
                     
-                    value = self._parse_metric_value(result.output, metric_config)
+                    value = self._parse_metric_value(result.output, metric_config, metric_type)
                     if value is not None:
                         results[identifier] = value
                         self.logger.debug(f"Collected dynamic metric {metric_name} = {value}")
