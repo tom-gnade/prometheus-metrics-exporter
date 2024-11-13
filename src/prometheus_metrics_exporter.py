@@ -282,7 +282,7 @@ class ProgramConfig:
         self._source = source
         self._config: Dict[str, Any] = {}
         self._initial_exporter: Dict[str, Any] = {}
-        self._last_load_time: float = 0
+        self._last_load_time: float = float = self._source.config_path.stat().st_mtime
         self._lock: threading.Lock = threading.Lock()
         self._running_under_systemd: bool = bool(os.getenv('INVOCATION_ID'))
         self._start_time: datetime = self.now_utc()
