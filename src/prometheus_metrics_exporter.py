@@ -1453,12 +1453,17 @@ class ServiceMetricsCollector:
         self.config = config
         self.command_executor = CommandExecutor(self.config, logger)
         
+        # Debug log initialization
+        self.logger.debug(f"Initializing collector for service: {service_name}")
+        self.logger.debug(f"Service config: {service_config}")
+
         # Set up user context if specified
         self.user_context = None
         if 'run_as' in service_config:
             try:
                 username = service_config['run_as']
                 self.user_context = UserContext(username, logger)
+                self.logger.debug(f"Created user context for {username}")
             except Exception as e:
                 self.logger.error(f"Failed to initialize user context for {service_name}: {e}")
     
@@ -1467,15 +1472,18 @@ class ServiceMetricsCollector:
         results = {}
         self.logger.info(f"Starting metrics collection for service: {self.service_name}")
         self.logger.info(f"Service config: {self.service_config}")
-        
-        for group_name, group_config in self.service_config.get('metric_groups', {}).items():
+
+        metric_groups = self.service_config.get('metric_groups', {})
+        self.logger.debug(f"Found {len(metric_groups)} metric groups")
+
+        for group_name, group_config in metric_groups.items():
             self.logger.info(f"Processing metric group: {group_name}")
             self.logger.info(f"Group config: {group_config}")
             
-            group_type = MetricGroupType.from_config(group_config)
-            self.logger.info(f"Group type determined as: {group_type}")
-            
             try:
+                group_type = MetricGroupType.from_config(group_config)
+                self.logger.info(f"Group type determined as: {group_type}")
+            
                 if group_type == MetricGroupType.STATIC:
                     self.logger.info(f"Processing static metric group: {group_name}")
                     # Process static metrics
@@ -1488,12 +1496,13 @@ class ServiceMetricsCollector:
                                 group_type=MetricGroupType.STATIC,
                                 description=metric_config['description']
                             )
-                            results[identifier] = float(metric_config['value'])
+                            value = float(metric_config['value'])
+                            results[identifier] = value
                             self.logger.info(f"Added static metric: {identifier.prometheus_name} = {metric_config['value']}")
                         except Exception as e:
                             self.logger.error(f"Failed to process static metric {metric_name}: {e}")
                 else:
-                    self.logger.info(f"Processing dynamic metric group: {group_name}")
+                    self.logger.debug(f"Processing dynamic metric group: {group_name}")
                     try:
                         group_metrics = await self.collect_group(group_name, group_config)
                         self.logger.info(f"Group {group_name} collection results: {group_metrics}")
@@ -1503,7 +1512,7 @@ class ServiceMetricsCollector:
             except Exception as e:
                 self.logger.error(f"Failed to process group {group_name}: {e}", exc_info=True)
         
-        self.logger.info(f"Service {self.service_name} final collection results: {results}")
+        self.logger.debug(f"Service {self.service_name} final collection results: {results}")
         return results
     
     async def collect_group(
@@ -1626,8 +1635,11 @@ class MetricsCollector:
         self._last_collection_times: Dict[MetricIdentifier, datetime] = {}
         self.collection_manager = CollectionManager(config, logger)
         
+        # Add initialization debug logging
+        self.logger.debug("Initializing MetricsCollector")
         self._initialize_collectors()
         self._setup_internal_metrics()
+        self.logger.debug(f"Initialized {len(self.service_collectors)} service collectors")
     
     def _initialize_collectors(self):
         """Initialize collectors for each service."""
@@ -1677,6 +1689,9 @@ class MetricsCollector:
         errors = 0
         
         try:
+            # Debug log the collection attempt
+            self.logger.debug(f"Starting metrics collection with {len(self.service_collectors)} collectors")
+
             # Update uptime metric
             self._internal_metrics['uptime'].set(self.config.get_uptime_seconds())
             
@@ -1685,14 +1700,21 @@ class MetricsCollector:
                 self.service_collectors
             )
             
+            # Debug log the raw results
+            self.logger.debug(f"Raw collection results: {service_results}")
+
             # Process results from each service
             for service_name, metrics in service_results.items():
+                self.logger.debug(f"Processing results for service {service_name}: {metrics}")
                 if isinstance(metrics, Dict) and metrics:  # Check if we got any metrics
                     success_count += len(metrics)
+                    self._update_prometheus_metrics(metrics)
                 else:
                     self.logger.error(f"Failed to collect metrics for {service_name}")
                     errors += 1
             
+            self.logger.debug(f"Current Prometheus metrics: {[m.name for m in self._prometheus_metrics.values()]}")
+
             # Update statistics
             collection_time = self.config.now_utc().timestamp() - collection_start
             self.stats.successful += success_count
@@ -2247,8 +2269,8 @@ class MetricsExporter:
         try:
 
             # Create a simple test metric
-            test_metric = Gauge('test_metric', 'Test metric to verify Prometheus registration')
-            test_metric.set(42.0)
+            # test_metric = Gauge('test_metric', 'Test metric to verify Prometheus registration')
+            # test_metric.set(42.0)
 
             # Check ports before starting
             if not self.check_ports():
