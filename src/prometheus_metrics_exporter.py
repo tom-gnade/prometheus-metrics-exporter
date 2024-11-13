@@ -151,6 +151,9 @@ import yaml
 # Verbose Logging for Development
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
+VERBOSE_DEBUG = False
+VERBOSE_LEVEL = 15  # DEBUG 10, INFO 20
+logging.addLevelName(VERBOSE_LEVEL, 'VERBOSE')
 class VerboseLogger(logging.Logger):
     """Enhanced Logger class adding development-only verbose debugging capabilities
     
@@ -160,13 +163,6 @@ class VerboseLogger(logging.Logger):
         3. Requires no configuration or runtime overhead
         4. Works seamlessly with existing logger methods
     """
-    # Class-level config - keep False by default, only enable during development
-    VERBOSE_DEBUG = False
-
-    # Create a custom VERBOSE level below DEBUG
-    VERBOSE = 5  # VERBOSE is 5, DEBUG is 10, INFO is 20
-    logging.addLevelName(VERBOSE, 'VERBOSE')
-
     def verbose(
         self,
         msg: Union[str, Callable[[], str]],
@@ -180,15 +176,15 @@ class VerboseLogger(logging.Logger):
         # Handle deferred evaluation of expensive computations
         if callable(msg):
             if args or kwargs:
-                self.log(self.VERBOSE, msg(*args, **kwargs))
+                self.log(self.VERBOSE_LEVEL, msg(*args, **kwargs))
             else:
-                self.log(self.VERBOSE, msg())
+                self.log(self.VERBOSE_LEVEL, msg())
         # Handle string formatting
         elif args or kwargs:
-            self.log(self.VERBOSE, msg.format(*args, **kwargs))
+            self.log(self.VERBOSE_LEVEL, msg.format(*args, **kwargs))
         # Handle simple strings
         else:
-            self.log(self.VERBOSE, msg)
+            self.log(self.VERBOSE_LEVEL, msg)
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Core Exceptions
