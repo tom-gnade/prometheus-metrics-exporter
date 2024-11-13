@@ -127,6 +127,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import Future
 from contextlib import contextmanager
 from copy import deepcopy
@@ -2031,29 +2032,35 @@ class HealthCheck:
             return [json.dumps(response, indent=2).encode()]
         
         return app
-
+    
     def _get_metrics_inventory(self) -> Dict[str, Any]:
         """Get metrics inventory with collection status."""
-        metrics_info = {}
+        metrics_info = OrderedDict()
         last_collections = self.metrics_collector._last_collection_times
-        services_config = self.config.services  # Using validated config
+        services_config = self.config.services
         
-        for service_name, service_config in services_config.items():
+        # Process services in sorted order
+        for service_name in sorted(services_config.keys()):
+            service_config = services_config[service_name]
             service_info = {
                 "description": service_config.get("description", ""),
                 "run_as": service_config.get("run_as"),
-                "metric_groups": {}
+                "metric_groups": OrderedDict()
             }
             
-            for group_name, group_config in service_config.get("metric_groups", {}).items():
+            # Process groups in sorted order
+            for group_name in sorted(service_config.get("metric_groups", {}).keys()):
+                group_config = service_config["metric_groups"][group_name]
                 group_type = MetricGroupType.from_config(group_config)
                 group_info = {
                     "type": group_type.value,
                     "command": group_config.get("command", "") if group_type == MetricGroupType.DYNAMIC else None,
-                    "metrics": {}
+                    "metrics": OrderedDict()
                 }
                 
-                for metric_name, metric_config in group_config.get("metrics", {}).items():
+                # Process metrics in sorted order
+                for metric_name in sorted(group_config.get("metrics", {}).keys()):
+                    metric_config = group_config["metrics"][metric_name]
                     identifier = MetricIdentifier(
                         service=service_name,
                         group=group_name,
@@ -2066,24 +2073,24 @@ class HealthCheck:
                     # Only include metrics that have been validated and are being collected
                     if identifier in self.metrics_collector._prometheus_metrics:
                         last_collection = last_collections.get(identifier)
-                        metric_info = {
-                            "type": (identifier.type.value if identifier.type else "static"),
-                            "description": metric_config.get("description", ""),
-                            "prometheus_name": identifier.prometheus_name,
-                            "last_collection_utc": (
+                        metric_info = OrderedDict([
+                            ("type", (identifier.type.value if identifier.type else "static")),
+                            ("description", metric_config.get("description", "")),
+                            ("prometheus_name", identifier.prometheus_name),
+                            ("last_collection_utc", (
                                 last_collection.isoformat() if last_collection else None
-                            ),
-                            "settings": {}
-                        }
+                            )),
+                            ("settings", OrderedDict())
+                        ])
                         
                         if group_type == MetricGroupType.STATIC:
                             metric_info["settings"]["value"] = metric_config.get("value")
                         else:
-                            metric_info["settings"].update({
-                                "content_type": metric_config.get("content_type", "text"),
-                                "filter": metric_config.get("filter"),
-                                "value_on_error": metric_config.get("value_on_error")
-                            })
+                            metric_info["settings"].update(OrderedDict([
+                                ("content_type", metric_config.get("content_type", "text")),
+                                ("filter", metric_config.get("filter")),
+                                ("value_on_error", metric_config.get("value_on_error"))
+                            ]))
                         
                         group_info["metrics"][metric_name] = metric_info
                 
