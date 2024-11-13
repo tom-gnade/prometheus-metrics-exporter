@@ -1411,9 +1411,28 @@ class ServiceMetricsCollector:
             if not group_config.get('expose_metrics', True):
                 self.logger.debug(f"Skipping unexposed group: {group_name}")
                 continue
+
+            # First, handle static metrics for this group
+            for metric_name, metric_config in group_config.get('metrics', {}).items():
+                try:
+                    metric_type = MetricType.from_config(metric_config)
+                    if metric_type == MetricType.STATIC:
+                        identifier = MetricIdentifier(
+                            service=self.service_name,
+                            group=group_name,
+                            name=metric_name,
+                            type=metric_type,
+                            description=metric_config.get('description', f'Metric {metric_name}')
+                        )
+                        value = float(metric_config.get('value', 0))
+                        results[identifier] = value
+                        self.logger.debug(f"Added static metric {metric_name} = {value}")
+                except Exception as e:
+                    self.logger.error(f"Failed to process static metric {metric_name}: {e}")
             
+            # Then handle dynamic metrics that need command execution
             try:
-                self.logger.debug(f"Collecting metrics for group: {group_name}")
+                self.logger.debug(f"Collecting dynamic metrics for group: {group_name}")
                 group_metrics = await self.collect_group(group_name, group_config)
                 self.logger.debug(f"Group {group_name} collection results: {group_metrics}")
                 results.update(group_metrics)
@@ -1428,14 +1447,14 @@ class ServiceMetricsCollector:
         group_name: str,
         group_config: Dict
     ) -> Dict[MetricIdentifier, float]:
-        """Collect all metrics in a group from a single source read."""
+        """Collect all non-static metrics in a group from a single source read."""
         self.logger.debug(f"Starting collection for group {group_name}")
         
         try:
             results = {}
             command_output = None
             
-            # Execute command if present (needed for non-static metrics)
+            # Execute command if needed for non-static metrics
             command = group_config.get('command')
             if command:
                 result = await self.command_executor.execute_command(
@@ -1450,10 +1469,13 @@ class ServiceMetricsCollector:
                 elif command_output is None:
                     self.logger.debug(f"No source data for group {group_name}")
 
-            # Process all metrics in the group
+            # Process only non-static metrics
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
                     metric_type = MetricType.from_config(metric_config)
+                    if metric_type == MetricType.STATIC:
+                        continue  # Skip static metrics, they're handled in collect_metrics
+
                     identifier = MetricIdentifier(
                         service=self.service_name,
                         group=group_name,
@@ -1462,18 +1484,9 @@ class ServiceMetricsCollector:
                         description=metric_config.get('description', f'Metric {metric_name}')
                     )
 
-                    # Handle static metrics regardless of command output
-                    if metric_type == MetricType.STATIC:
-                        value = self._parse_metric_value(None, metric_config, metric_type)
-                        if value is not None:
-                            results[identifier] = value
-                            self.logger.debug(f"Collected static metric {metric_name} = {value}")
-                        continue
-
-                    # For non-static metrics, ensure we have command output
                     if command_output is None:
                         if 'value_on_error' in metric_config:
-                            value = metric_config['value_on_error']
+                            value = float(metric_config['value_on_error'])
                             self.logger.debug(
                                 f"Using error value {value} for metric {metric_name} "
                                 f"due to missing command output"
@@ -1489,7 +1502,6 @@ class ServiceMetricsCollector:
                 except Exception as e:
                     self.logger.error(f"Failed to parse metric {metric_name}: {e}")
                     
-            self.logger.debug(f"Group {group_name} collection results: {results}")
             return results
                     
         except Exception as e:
