@@ -883,9 +883,11 @@ class ProgramLogger:
     
     def _get_formatter(self) -> logging.Formatter:
         """Create formatter using current settings."""
+        # Access raw config dictionary instead of using properties
+        log_settings = self.config._config['exporter']['logging']
         return logging.Formatter(
-            self.config.logging['format'],
-            self.config.logging['date_format']
+            log_settings['format'],
+            log_settings['date_format']
         )
 
     def _setup_logging(self) -> logging.Logger:
