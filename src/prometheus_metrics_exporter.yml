@@ -1,11 +1,74 @@
 # Prometheus Metrics Exporter Configuration
 #
+# Configuration supports:
+# - Dynamic service configuration reloading
+# - User context switching for command execution
+# - Parallel metric collection
+# - Comprehensive health monitoring
+#
 # Metric Types:
-# - gauge    : A value that can go up and down (default)
-# - static   : Fixed value specified in this configuration (specify "value" instead of a "command")
-# - counter  : A value that only increases (not supported)
-# - summary  : Basic statistics about values (not supported)
-# - histogram: Distribution of values in buckets (not supported)
+# - gauge   : A value that can go up and down (default for dynamic metrics)
+# - counter : A value that only increases
+# - static  : Fixed value specified in configuration
+#
+# Note: Exporter section changes require service restart,
+# while services section supports live reloading.
+#
+# Exporter Service Configuration (optional):
+# exporter:              # Optional, defaults provided
+#   metrics_port: 9101   # Prometheus metrics endpoint
+#   health_port: 9102    # Health check endpoint
+#   collection:          # Collection settings
+#     poll_interval_sec: 5
+#   logging:            # Logging configuration
+#     level: "DEBUG"
+#
+# services:             # Required
+#   service_name:       # Service identifier
+#     description: ""   # Service description
+#     run_as: user     # Optional execution user
+#     metric_groups:    # Group metrics by collection
+#       group_name:     # Group identifier
+#         type: "dynamic"|"static"  # Group type
+#         command: ""   # Required for dynamic groups
+#         metrics:      # Individual metrics
+#           metric_name:
+#             type: "gauge"|"counter"  # For dynamic metrics
+#             description: ""
+#             filter: ""    # regex or jq path
+#             value: 0.0   # For static metrics
+#
+# Monitored Services Configuration (example):
+#services:
+#    algorand_node: # A service name
+#        description: "Algorand node services"
+#        run_as: algorand
+#        metric_groups:
+#            # Dynamic metric group example
+#            status:
+#                command: "/usr/bin/goal node status -d /var/lib/algorand"
+#                metrics:
+#                    sync_time:
+#                        type: "gauge"
+#                        description: "Node synchronization time in seconds"
+#                        filter: "Sync Time: ([0-9.]+)s"
+#            data_store:
+#                command: "du -sb /var/lib/algorand"
+#                metrics:
+#                    bytes:
+#                        type: "gauge"
+#                        description: "Algorand data storage directory size"
+#                        filter: "^(\\d+)"
+#            # Static metric group example
+#            constants:
+#                type: "static"
+#                metrics:
+#                    version:
+#                        description: "Node version as a constant"
+#                        value: 1.0
+#                    feature_flag:
+#                        description: "Feature flag as a constant"
+#                        value: 0.0
 
 # Exporter Configuration (optional)
 exporter:

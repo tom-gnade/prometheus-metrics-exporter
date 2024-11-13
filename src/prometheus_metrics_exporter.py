@@ -10,7 +10,7 @@ A flexible metrics collection and exposition service supporting:
 - Multiple service monitoring with user context switching
 - File watching with content type handling
 - HTTP endpoint scraping
-- Dynamic configuration with templates
+- Dynamic configuration reloading 
 - Error handling and health checks
 - Automatic user permission management
 
@@ -52,18 +52,15 @@ services:
         run_as: username       # Optional username to execute commands
         metric_groups:
             group_name:        # Logical grouping of metrics that share a command
-                command: "shell command that produces output"
-                expose_metrics: true  # Optional, default true
+                command: "shell command that produces output"  # Required for dynamic groups
+                type: "dynamic|static"  # Optional, defaults to dynamic
                 metrics:
                     metric_name:
-                        type: "gauge|static|counter"  # Required metric type
+                        type: "gauge|counter"  # Required for dynamic metrics
                         description: "Metric description"  # Required description
-                        filter: "regex or jq-style filter"  # Required for non-static
+                        filter: "regex or jq-style filter"  # Required for dynamic metrics
                         content_type: "text|json"  # How to parse output, default text
-                        value: 1.0  # Required for static metrics
-                        value_on_error: 0.0  # Optional fallback value
-
-# Note: Services section supports runtime reloading
+                        value: 1.0  # Required for static metrics only
 
 Health Check API:
 ---------------------
@@ -137,7 +134,7 @@ from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import (
-    Awaitable, Any, Dict, List, Optional, 
+    Any, Awaitable, Callable, Dict, List, Optional, 
     TYPE_CHECKING, Union
 )
 from wsgiref.simple_server import make_server
@@ -149,6 +146,60 @@ from prometheus_client import (
 from cysystemd.daemon import notify, Notification
 from cysystemd import journal
 import yaml
+
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+# Verbose Logging for Development
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
+class VerboseLogger(logging.Logger):
+    """Enhanced Logger class adding development-only verbose debugging capabilities
+    
+        This logger subclass adds a verbose() method for development debugging that:
+        1. Has zero runtime impact when VERBOSE_DEBUG = False
+        2. Supports both simple strings and deferred evaluation of expensive computations
+        3. Requires no configuration or runtime overhead
+        4. Works seamlessly with existing logger methods
+    """
+    # Class-level config - keep False by default, only enable during development
+    VERBOSE_DEBUG = False
+
+    def verbose(
+        self,
+        msg: Union[str, Callable[[], str]],
+        *args: Any,
+        **kwargs: Any
+    ) -> None:
+        """Log verbose debug messages with efficient deferred evaluation.
+        
+        When VERBOSE_DEBUG = False, returns immediately with no processing overhead.
+        When enabled, supports both direct messages and deferred expensive computations.
+
+        Args:
+            msg: Message to log or callable that produces the message
+            *args: Format string arguments
+            **kwargs: Format string keyword arguments
+
+        Example:
+            logger.verbose("Simple message")  # Direct string
+            logger.verbose("Count: {}", count)  # Format args
+            logger.verbose("User: {name}", name=user)  # Format kwargs
+            logger.verbose(lambda: f"Active: {[u for u in users if u.active]}")  # Deferred
+        """
+        if not self.VERBOSE_DEBUG:
+            return
+
+        # Handle deferred evaluation of expensive computations
+        if callable(msg):
+            if args or kwargs:
+                super().debug(msg(*args, **kwargs))
+            else:
+                super().debug(msg())
+        # Handle string formatting
+        elif args or kwargs:
+            super().debug(msg.format(*args, **kwargs))
+        # Handle simple strings
+        else:
+            super().debug(msg)
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Core Exceptions
@@ -494,7 +545,7 @@ class ProgramConfig:
         if not isinstance(group_config, dict):
             raise MetricConfigurationError("Must be a dictionary")
 
-        self.logger.debug(f"Validating metric group {group_name} in service {service_name}")
+        self.logger.verbose(f"Validating metric group {group_name} in service {service_name}")
         validated = {'metrics': {}}
         
         # Determine group type
@@ -505,7 +556,7 @@ class ProgramConfig:
             # Validate static metrics
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    self.logger.debug(f"Validating static metric {metric_name}")
+                    self.logger.verbose(f"Validating static metric {metric_name}")
                     
                     # Ensure no metric_type is specified for static metrics
                     if 'type' in metric_config:
@@ -523,7 +574,7 @@ class ProgramConfig:
                         'description': metric_config['description'],
                         'value': float(metric_config['value'])
                     }
-                    self.logger.debug(f"Static metric {metric_name} validated successfully")
+                    self.logger.verbose(f"Static metric {metric_name} validated successfully")
                 except Exception as e:
                     self.logger.error(f"Failed to validate static metric {metric_name}: {e}")
                     raise
@@ -537,7 +588,7 @@ class ProgramConfig:
             # Validate dynamic metrics
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    self.logger.debug(f"Validating dynamic metric {metric_name}")
+                    self.logger.verbose(f"Validating dynamic metric {metric_name}")
                     
                     # Ensure no static metrics in dynamic groups
                     if metric_config.get('type', '').lower() == 'static':
@@ -558,17 +609,16 @@ class ProgramConfig:
                         'filter': metric_config['filter']
                     }
                     
-                    # Copy optional fields
-                    for field in ['content_type', 'value_on_error']:
-                        if field in metric_config:
-                            validated['metrics'][metric_name][field] = metric_config[field]
+                    # Copy optional content_type if present
+                    if 'content_type' in metric_config:
+                        validated['metrics'][metric_name]['content_type'] = metric_config['content_type']
                     
-                    self.logger.debug(f"Dynamic metric {metric_name} validated successfully")
+                    self.logger.verbose(f"Dynamic metric {metric_name} validated successfully")
                 except Exception as e:
                     self.logger.error(f"Failed to validate dynamic metric {metric_name}: {e}")
                     raise
 
-        self.logger.debug(f"Validated metrics for group {group_name}: {validated['metrics']}")
+        self.logger.verbose(f"Validated metrics for group {group_name}: {validated['metrics']}")
 
         if not validated['metrics']:
             raise MetricConfigurationError("No valid metrics defined")
@@ -583,7 +633,7 @@ class ProgramConfig:
             metric_config: Dict[str, Any]
         ) -> Optional[Dict[str, Any]]:
             """Validate individual metric configuration."""
-            self.logger.debug(f"Starting validation of metric {metric_name}")
+            self.logger.verbose(f"Starting validation of metric {metric_name}")
             
             if not isinstance(metric_config, dict):
                 raise MetricConfigurationError("Must be a dictionary")
@@ -595,7 +645,7 @@ class ProgramConfig:
                 raise MetricConfigurationError("Missing required field: type")
             
             metric_type = MetricType.from_config(metric_config)
-            self.logger.debug(f"Metric {metric_name} type: {metric_type}")
+            self.logger.verbose(f"Metric {metric_name} type: {metric_type}")
                 
             if 'description' not in metric_config:
                 raise MetricConfigurationError("Missing required field: description")
@@ -605,25 +655,24 @@ class ProgramConfig:
 
             try:
                 if metric_type == MetricType.STATIC:
-                    self.logger.debug(f"Validating static metric {metric_name}")
+                    self.logger.verbose(f"Validating static metric {metric_name}")
                     if 'value' not in metric_config:
                         raise MetricConfigurationError("Static metric must specify a value")
                     validated['value'] = float(metric_config['value'])
-                    self.logger.debug(f"Static metric {metric_name} value: {validated['value']}")
+                    self.logger.verbose(f"Static metric {metric_name} value: {validated['value']}")
                 else:  # gauge or counter
-                    self.logger.debug(f"Validating non-static metric {metric_name}")
+                    self.logger.verbose(f"Validating dynamic metric {metric_name}")
                     if 'filter' not in metric_config:
                         raise MetricConfigurationError(
                             f"{metric_type.value} metric must specify a filter"
                         )
                     validated['filter'] = metric_config['filter']
 
-                # Copy optional fields
-                for field in ['content_type', 'value_on_error', 'collection_frequency']:
-                    if field in metric_config:
-                        validated[field] = metric_config[field]
+                # Copy optional content_type if present
+                if 'content_type' in metric_config:
+                    validated['content_type'] = metric_config['content_type']
 
-                self.logger.debug(f"Successfully validated metric {metric_name}: {validated}")
+                self.logger.verbose(f"Successfully validated metric {metric_name}: {validated}")
                 return validated
 
             except Exception as e:
@@ -767,6 +816,10 @@ class ProgramLogger:
             source: Program source information
             config: Program configuration
         """
+
+        # Set VerboseLogger as the default logger class
+        logging.setLoggerClass(VerboseLogger)
+
         self.source = source
         self.config = config
         self._handlers: Dict[str, logging.Handler] = {}
@@ -1051,49 +1104,45 @@ class ContentType(Enum):
         try:
             if self == ContentType.TEXT:
                 match = re.search(filter_expr, content)
-                return float(match.group(1)) if match else None
+                if not match:
+                    raise MetricValidationError("Pattern did not match content")
+                try:
+                    return float(match.group(1))
+                except (TypeError, ValueError) as e:
+                    raise MetricValidationError(f"Could not convert '{match.group(1)}' to float: {e}")
                 
             elif self == ContentType.JSON:
                 try:
                     data = json.loads(content)
                 except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON content: {e}")
-                    return None
+                    raise MetricValidationError(f"Invalid JSON content: {e}")
                     
                 # Handle jq-style filter (e.g. ".status.block_height")
+                for key in filter_expr.strip('.').split('.'):
+                    if not isinstance(data, dict):
+                        raise MetricValidationError(
+                            f"Cannot access '{key}' in path '{filter_expr}': "
+                            f"value '{data}' is not an object"
+                        )
+                    if key not in data:
+                        raise MetricValidationError(
+                            f"Key '{key}' not found in path '{filter_expr}': "
+                            f"available keys {list(data.keys())}"
+                        )
+                    data = data[key]
+                        
                 try:
-                    for key in filter_expr.strip('.').split('.'):
-                        if not isinstance(data, dict):
-                            logger.error(
-                                f"Cannot access '{key}' in path '{filter_expr}': "
-                                f"value '{data}' is not an object"
-                            )
-                            return None
-                        if key not in data:
-                            logger.error(
-                                f"Key '{key}' not found in path '{filter_expr}': "
-                                f"available keys {list(data.keys())}"
-                            )
-                            return None
-                        data = data[key]
-                        
-                    try:
-                        return float(data)
-                    except (TypeError, ValueError) as e:
-                        logger.error(
-                            f"Could not convert value '{data}' to float"
-                            f"at path '{filter_expr}'")
-                        return None
-                        
-                except Exception as e:
-                    logger.error(f"Error traversing JSON path: {e}")
-                    return None
-                
-            return None
-            
+                    return float(data)
+                except (TypeError, ValueError) as e:
+                    raise MetricValidationError(
+                        f"Could not convert value '{data}' to float "
+                        f"at path '{filter_expr}': {e}"
+                    )
+                    
+        except MetricValidationError:
+            raise
         except Exception as e:
-            logger.warning(f"Failed to parse {self.value} response: {e}")
-            return None
+            raise MetricValidationError(f"Failed to parse {self.value} response: {e}")
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -1343,7 +1392,7 @@ class CommandExecutor:
         user_context: Optional[UserContext] = None
     ) -> CommandResult:
         """Execute command with optional user context."""
-        self.logger.debug(f"Executing command: {command}")
+        self.logger.verbose(f"Executing command: {command}")
         start_time = self.config.now_utc().timestamp()
         
         try:
@@ -1417,7 +1466,7 @@ class CollectionManager:
         service_names = []
         
         for service_name, collector in collectors.items():
-            self.logger.debug(f"Creating collection task for service: {service_name}")
+            self.logger.verbose(f"Creating collection task for service: {service_name}")
             tasks.append(
                 self.collect_with_timeout(
                     collector.collect_metrics(),
@@ -1467,8 +1516,8 @@ class ServiceMetricsCollector:
         self.command_executor = CommandExecutor(self.config, logger)
         
         # Debug log initialization
-        self.logger.debug(f"Initializing collector for service: {service_name}")
-        self.logger.debug(f"Service config: {service_config}")
+        self.logger.verbose(f"Initializing collector for service: {service_name}")
+        self.logger.verbose(f"Service config: {service_config}")
 
         # Set up user context if specified
         self.user_context = None
@@ -1476,7 +1525,7 @@ class ServiceMetricsCollector:
             try:
                 username = service_config['run_as']
                 self.user_context = UserContext(username, logger)
-                self.logger.debug(f"Created user context for {username}")
+                self.logger.verbose(f"Created user context for {username}")
             except Exception as e:
                 self.logger.error(f"Failed to initialize user context for {service_name}: {e}")
     
@@ -1487,7 +1536,7 @@ class ServiceMetricsCollector:
         self.logger.info(f"Service config: {self.service_config}")
 
         metric_groups = self.service_config.get('metric_groups', {})
-        self.logger.debug(f"Found {len(metric_groups)} metric groups")
+        self.logger.verbose(f"Found {len(metric_groups)} metric groups")
 
         for group_name, group_config in metric_groups.items():
             self.logger.info(f"Processing metric group: {group_name}")
@@ -1515,7 +1564,7 @@ class ServiceMetricsCollector:
                         except Exception as e:
                             self.logger.error(f"Failed to process static metric {metric_name}: {e}")
                 else:
-                    self.logger.debug(f"Processing dynamic metric group: {group_name}")
+                    self.logger.verbose(f"Processing dynamic metric group: {group_name}")
                     try:
                         group_metrics = await self.collect_group(group_name, group_config)
                         self.logger.info(f"Group {group_name} collection results: {group_metrics}")
@@ -1525,7 +1574,7 @@ class ServiceMetricsCollector:
             except Exception as e:
                 self.logger.error(f"Failed to process group {group_name}: {e}", exc_info=True)
         
-        self.logger.debug(f"Service {self.service_name} final collection results: {results}")
+        self.logger.verbose(f"Service {self.service_name} final collection results: {results}")
         return results
     
     async def collect_group(
@@ -1535,31 +1584,18 @@ class ServiceMetricsCollector:
     ) -> Dict[MetricIdentifier, float]:
         """Collect metrics for a dynamic group."""
         self.logger.info(f"Starting collection for dynamic group {group_name}")
-        self.logger.info(f"Group config: {group_config}")
+        self.logger.verbose(f"Group config: {group_config}")
         results = {}
         
         try:
             # Execute command for dynamic metrics
             command = group_config['command']
-            self.logger.info(f"Executing command: {command}")
+            self.logger.debug(f"Executing command: {command}")
             result = await self.command_executor.execute_command(command, self.user_context)
-            self.logger.info(f"Command execution result: {result}")
+            self.logger.verbose(f"Command execution result: {result}")
             
             if not result.success:
                 self.logger.error(f"Command failed for group {group_name}: {result.error_message}")
-                # Handle error values if specified
-                for metric_name, metric_config in group_config.get('metrics', {}).items():
-                    if 'value_on_error' in metric_config:
-                        identifier = MetricIdentifier(
-                            service=self.service_name,
-                            group=group_name,
-                            name=metric_name,
-                            group_type=MetricGroupType.DYNAMIC,
-                            type=MetricType.from_config(metric_config),
-                            description=metric_config['description']
-                        )
-                        results[identifier] = float(metric_config['value_on_error'])
-                        self.logger.info(f"Using error value for {metric_name}: {metric_config['value_on_error']}")
                 return results
 
             # Parse metrics from command output
@@ -1584,9 +1620,6 @@ class ServiceMetricsCollector:
                     if value is not None:
                         results[identifier] = value
                         self.logger.info(f"Collected dynamic metric {metric_name} = {value}")
-                    elif 'value_on_error' in metric_config:
-                        results[identifier] = float(metric_config['value_on_error'])
-                        self.logger.info(f"Using error value for {metric_name} = {metric_config['value_on_error']}")
                         
                 except Exception as e:
                     self.logger.error(f"Failed to collect dynamic metric {metric_name}: {e}", exc_info=True)
@@ -1605,32 +1638,38 @@ class ServiceMetricsCollector:
         ) -> Optional[float]:
             """Parse individual metric value from group's source data."""
             try:
-                # Handle gauge and counter metrics
                 if source_data is None:
-                    self.logger.debug("No source data available")
-                    return metric_config.get('value_on_error')
+                    self.logger.verbose("No source data available")
+                    return None
                 
                 if 'filter' not in metric_config:
                     self.logger.error(f"{metric_type.value} metric must specify a filter")
                     return None
 
                 content_type = metric_config.get('content_type', 'text')
-                content_type_enum = ContentType(content_type)
-                value = content_type_enum.parse_value(
-                    source_data,
-                    metric_config['filter'],
-                    self.logger
-                )
-                
-                if value is None and 'value_on_error' in metric_config:
-                    return metric_config['value_on_error']
-                
-                return value
-                
+                try:
+                    content_type_enum = ContentType(content_type)
+                    value = content_type_enum.parse_value(
+                        source_data,
+                        metric_config['filter'],
+                        self.logger
+                    )
+                    if value is None:
+                        raise MetricValidationError("Parser returned None value")
+                    return float(value)  # Final validation that value is numeric
+                    
+                except (TypeError, ValueError, MetricValidationError) as e:
+                    self.logger.warning(
+                        f"Failed to validate metric value: {e}. "
+                        f"Skipping this metric but continuing collection."
+                    )
+                    return None
+                    
             except Exception as e:
-                self.logger.error(f"Failed to parse value: {e}")
-                if 'value_on_error' in metric_config:
-                    return metric_config['value_on_error']
+                self.logger.warning(
+                    f"Unexpected error parsing metric value: {e}. "
+                    f"Skipping this metric but continuing collection."
+                )
                 return None
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
@@ -1639,21 +1678,19 @@ class MetricsCollector:
     """Main metrics collector managing multiple services."""
     
     def __init__(self, config: ProgramConfig, logger: logging.Logger):
-        self.config = config
-        self.logger = logger
-        self.stats = CollectionStats()
-        self.service_collectors: Dict[str, ServiceMetricsCollector] = {}
-        self._prometheus_metrics: Dict[MetricIdentifier, Union[Gauge, Counter]] = {}
-        self._timestamp_metrics: Dict[str, Gauge] = {}
-        self._previous_values: Dict[MetricIdentifier, float] = {}
-        self._last_collection_times: Dict[MetricIdentifier, datetime] = {}
-        self.collection_manager = CollectionManager(config, logger)
-        
-        # Register for config reload notifications
-        self.config.register_reload_callback(self._reinitialize_collectors)
-        
-        self._initialize_collectors()
-        self._setup_internal_metrics()
+            self.config = config
+            self.logger = logger
+            self.stats = CollectionStats()
+            self.service_collectors: Dict[str, ServiceMetricsCollector] = {}
+            self._prometheus_metrics: Dict[MetricIdentifier, Union[Gauge, Counter]] = {}
+            self._previous_values: Dict[MetricIdentifier, float] = {}
+            self.collection_manager = CollectionManager(config, logger)
+            
+            # Register for config reload notifications
+            self.config.register_reload_callback(self._reinitialize_collectors)
+            
+            self._initialize_collectors()
+            self._setup_internal_metrics()
     
     def _initialize_collectors(self):
         """Initialize collectors for each service."""
@@ -1724,8 +1761,6 @@ class MetricsCollector:
 
     def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
         """Update Prometheus metrics with collected values."""
-        collection_time = round(self.config.now_utc().timestamp(), 3)
-        
         # Sort metrics by service, group, and metric name
         sorted_metrics = sorted(
             metrics.items(),
@@ -1736,24 +1771,16 @@ class MetricsCollector:
         for identifier, value in sorted_metrics:
             try:
                 metric_name = identifier.prometheus_name
-                self.logger.debug(f"Processing metric: {metric_name} = {value}")
+                self.logger.verbose(f"Processing metric: {metric_name} = {value}")
                 
                 # Create metric if it doesn't exist
                 if identifier not in self._prometheus_metrics:
                     self.logger.info(f"Creating new Prometheus metric: {metric_name}")
                     metric = self._create_prometheus_metric(identifier)
                     self._prometheus_metrics[identifier] = metric
-                    
-                    # Create timestamp metric in separate dictionary
-                    timestamp_name = f"{metric_name}_last_collected_unix_seconds"
-                    self._timestamp_metrics[timestamp_name] = Gauge(
-                        timestamp_name,
-                        f"Unix timestamp when {metric_name} was last collected"
-                    )
                 
                 if value is not None:
                     metric = self._prometheus_metrics[identifier]
-                    self._last_collection_times[identifier] = self.config.now_utc()
                     
                     # Update the metric value
                     if isinstance(metric, Counter):
@@ -1765,10 +1792,6 @@ class MetricsCollector:
                     else:  # Gauge
                         metric.set(value)
                         self.logger.info(f"Set gauge {metric_name} to {value}")
-
-                    # Update timestamp in separate dictionary
-                    timestamp_name = f"{metric_name}_last_collected_unix_seconds"
-                    self._timestamp_metrics[timestamp_name].set(collection_time)
                         
             except Exception as e:
                 self.logger.error(f"Failed to update metric {identifier.prometheus_name}: {e}")
@@ -1804,7 +1827,7 @@ class MetricsCollector:
             
             # Process results from each service
             for service_name, metrics in service_results.items():
-                self.logger.debug(f"Processing results for service {service_name}: {metrics}")
+                self.logger.verbose(f"Processing results for service {service_name}: {metrics}")
                 if isinstance(metrics, Dict) and metrics:
                     success_count += len(metrics)
                     # Update Prometheus metrics with the collected values
@@ -1815,7 +1838,6 @@ class MetricsCollector:
             
             # Debug log final metrics state
             self.logger.debug(f"Current metrics count: {len(self._prometheus_metrics)}")
-            self.logger.debug(f"Current timestamp metrics count: {len(self._timestamp_metrics)}")
             
             # Update statistics
             collection_time = self.config.now_utc().timestamp() - collection_start
@@ -2036,7 +2058,6 @@ class HealthCheck:
     def _get_metrics_inventory(self) -> Dict[str, Any]:
         """Get metrics inventory with collection status."""
         metrics_info = OrderedDict()
-        last_collections = self.metrics_collector._last_collection_times
         services_config = self.config.services
         
         # Process services in sorted order
@@ -2072,14 +2093,10 @@ class HealthCheck:
                     
                     # Only include metrics that have been validated and are being collected
                     if identifier in self.metrics_collector._prometheus_metrics:
-                        last_collection = last_collections.get(identifier)
                         metric_info = OrderedDict([
                             ("type", (identifier.type.value if identifier.type else "static")),
                             ("description", metric_config.get("description", "")),
                             ("prometheus_name", identifier.prometheus_name),
-                            ("last_collection_utc", (
-                                last_collection.isoformat() if last_collection else None
-                            )),
                             ("settings", OrderedDict())
                         ])
                         
@@ -2088,8 +2105,7 @@ class HealthCheck:
                         else:
                             metric_info["settings"].update(OrderedDict([
                                 ("content_type", metric_config.get("content_type", "text")),
-                                ("filter", metric_config.get("filter")),
-                                ("value_on_error", metric_config.get("value_on_error"))
+                                ("filter", metric_config.get("filter"))
                             ]))
                         
                         group_info["metrics"][metric_name] = metric_info
@@ -2185,7 +2201,7 @@ class MetricsExporter:
         signal_name = signal.Signals(signum).name
         self.logger.info(f"Received {signal_name}, initiating shutdown...")
         try:
-            self.logger.debug("Cleanup completed, setting shutdown event")
+            self.logger.verbose("Cleanup completed, setting shutdown event")
             asyncio.get_event_loop().call_soon_threadsafe(self.shutdown_event.set)
         except Exception as e:
             self.logger.error(f"Error during signal cleanup: {e}")
@@ -2345,7 +2361,7 @@ class MetricsExporter:
                         
                     except Exception as e:
                         self.logger.error(f"Error in main loop: {e}")
-                        self.logger.debug("Exception details:", exc_info=True)
+                        self.logger.verbose("Exception details:", exc_info=True)
                         await asyncio.sleep(1)  # Avoid tight loop on persistent errors
             
                 self.logger.info("Shutdown event received, stopping service")
