@@ -1730,55 +1730,66 @@ class MetricsCollector:
         identifier: MetricIdentifier
     ) -> Union[Gauge, Counter]:
         """Create appropriate Prometheus metric based on identifier."""
+        metric_name = f"{identifier.service}_{identifier.group}_{identifier.name}"
+        
         if identifier.group_type == MetricGroupType.STATIC:
-            # Static metrics are always gauges
-            return Gauge(identifier.prometheus_name, identifier.description)
+            self.logger.info(f"Creating static gauge metric: {metric_name}")
+            return Gauge(metric_name, identifier.description)
         elif identifier.type == MetricType.COUNTER:
-            return Counter(identifier.prometheus_name, identifier.description)
+            self.logger.info(f"Creating counter metric: {metric_name}")
+            return Counter(metric_name, identifier.description)
         else:
-            return Gauge(identifier.prometheus_name, identifier.description)
+            self.logger.info(f"Creating gauge metric: {metric_name}")
+            return Gauge(metric_name, identifier.description)
 
     def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
         """Update Prometheus metrics with collected values."""
         collection_time = round(self.config.now_utc().timestamp(), 3)
         
-        self.logger.debug(f"Updating Prometheus metrics with {len(metrics)} metrics")
+        self.logger.info(f"Updating Prometheus metrics with {len(metrics)} metrics")
         for identifier, value in metrics.items():
-            self.logger.debug(f"Processing metric: {identifier.prometheus_name} "
-                            f"(group_type={identifier.group_type.value}, "
-                            f"type={identifier.type.value if identifier.type else 'none'}) = {value}")
-            
-            # Always create the metric if it doesn't exist
-            if identifier not in self._prometheus_metrics:
-                self.logger.debug(f"Creating new Prometheus metric for {identifier.prometheus_name}")
-                self._prometheus_metrics[identifier] = self._create_prometheus_metric(identifier)
-            
-            if value is not None:
-                metric = self._prometheus_metrics[identifier]
-                self._last_collection_times[identifier] = self.config.now_utc()
+            try:
+                metric_name = identifier.prometheus_name
+                self.logger.debug(f"Processing metric: {metric_name} = {value}")
                 
-                if identifier.group_type == MetricGroupType.STATIC:
-                    metric.set(value)
-                    self.logger.debug(f"Set static metric {identifier.prometheus_name} to {value}")
-                elif identifier.type == MetricType.COUNTER:
-                    prev_value = self._previous_values.get(identifier, 0)
-                    if value > prev_value:
-                        metric.inc(value - prev_value)
-                    self._previous_values[identifier] = value
-                    self.logger.debug(f"Updated counter {identifier.prometheus_name} to {value}")
-                else:  # GAUGE
-                    metric.set(value)
-                    self.logger.debug(f"Set gauge {identifier.prometheus_name} to {value}")
-
-                # Update timestamp metric
-                timestamp_metric_name = f"{identifier.prometheus_name}_last_collected_unix_seconds"
-                if timestamp_metric_name not in self._prometheus_metrics:
-                    self._prometheus_metrics[timestamp_metric_name] = Gauge(
-                        timestamp_metric_name,
-                        f"Unix timestamp when {identifier.prometheus_name} was last collected"
+                # Create metric if it doesn't exist
+                if identifier not in self._prometheus_metrics:
+                    self.logger.info(f"Creating new Prometheus metric: {metric_name}")
+                    metric = self._create_prometheus_metric(identifier)
+                    self._prometheus_metrics[identifier] = metric
+                    
+                    # Also create timestamp metric
+                    timestamp_name = f"{metric_name}_last_collected_unix_seconds"
+                    self._prometheus_metrics[timestamp_name] = Gauge(
+                        timestamp_name,
+                        f"Unix timestamp when {metric_name} was last collected"
                     )
-                self._prometheus_metrics[timestamp_metric_name].set(collection_time)
-                self.logger.debug(f"Updated timestamp for {identifier.prometheus_name}")
+                
+                if value is not None:
+                    metric = self._prometheus_metrics[identifier]
+                    self._last_collection_times[identifier] = self.config.now_utc()
+                    
+                    # Update the metric value
+                    if isinstance(metric, Counter):
+                        prev_value = self._previous_values.get(identifier, 0)
+                        if value > prev_value:
+                            metric.inc(value - prev_value)
+                        self._previous_values[identifier] = value
+                        self.logger.info(f"Updated counter {metric_name} to {value}")
+                    else:  # Gauge
+                        metric.set(value)
+                        self.logger.info(f"Set gauge {metric_name} to {value}")
+
+                    # Update timestamp
+                    timestamp_name = f"{metric_name}_last_collected_unix_seconds"
+                    if timestamp_name in self._prometheus_metrics:
+                        self._prometheus_metrics[timestamp_name].set(collection_time)
+                        
+            except Exception as e:
+                self.logger.error(f"Failed to update metric {identifier.prometheus_name}: {e}")
+
+        # Log final metrics state
+        self.logger.info(f"Current Prometheus metrics: {[m.name for m in self._prometheus_metrics.values()]}")
 
     def _update_internal_metrics(self, successes: int, errors: int, duration: float):
         """Update internal metrics."""
