@@ -266,11 +266,11 @@ class ProgramConfig:
             },
             'logging': {
                 'level': 'DEBUG',
-                'max_bytes': 10485760,  # 10MB
-                'backup_count': 3,
                 'file_level': 'DEBUG',
                 'console_level': 'INFO',
                 'journal_level': 'WARNING',
+                'max_bytes': 10485760,  # 10MB
+                'backup_count': 3,
                 'format': '%(asctime)s [%(process)d] [%(threadName)s] [%(name)s.%(funcName)s] [%(levelname)s] %(message)s',
                 'date_format': '%Y-%m-%d %H:%M:%S'
             }
@@ -320,13 +320,40 @@ class ProgramConfig:
         if 'exporter' in config:
             for key, value in config['exporter'].items():
                 if isinstance(value, dict) and key in result['exporter']:
-                    result['exporter'][key].update(value)
+                    result['exporter'][key] = self._merge_dicts(
+                        result['exporter'][key],
+                        value
+                    )
                 else:
-                    result['exporter'][key] = value
+                    result['exporter'][key] = deepcopy(value)
         
         # Services section is required and not defaulted
         result['services'] = config.get('services', {})
         
+        return result
+
+    def _merge_dicts(self, default: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively merge two dictionaries.
+        
+        Args:
+            default: Base dictionary containing default values
+            override: Dictionary containing override values
+        
+        Returns:
+            New dictionary with merged values
+        """
+        result = deepcopy(default)
+        
+        for key, value in override.items():
+            if (
+                key in result and
+                isinstance(result[key], dict) and
+                isinstance(value, dict)
+            ):
+                result[key] = self._merge_dicts(result[key], value)
+            else:
+                result[key] = deepcopy(value)
+                
         return result
 
     def _reset_validation_stats(self):
