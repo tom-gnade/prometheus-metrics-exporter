@@ -212,8 +212,7 @@ class ProgramSource:
     def log_path(self) -> Path:
         """Full path to log file."""
         path = self.script_dir / f"{self.base_name}.log"
-        if not path.exists():
-            path.touch()
+        
         if os.access(path, os.W_OK):
             return path
 
@@ -718,8 +717,18 @@ class ProgramLogger:
         self.source = source
         self.config = config
         self._handlers: Dict[str, logging.Handler] = {}
-        self._logger = self._setup_logging()
 
+        # Ensure log file exists and is owned by exporter user
+        log_path = self.source.script_dir / f"{self.source.base_name}.log"
+        if not log_path.exists():
+            user_context = UserContext(self.config.exporter_user, None)
+            with user_context.temp_context():
+                log_path.touch()
+                # Ensure mode is 0o644 (rw-r--r--)
+                log_path.chmod(0o644)
+        
+        self._logger = self._setup_logging()
+        
         # Attach logger to config after setup
         self.config.logger = self._logger
 
@@ -1427,27 +1436,42 @@ class ServiceMetricsCollector:
         group_name: str,
         group_config: Dict
     ) -> Dict[MetricIdentifier, float]:
-        """Collect all metrics in a group from a single source read."""
+        """Collect all metrics in a group from a single source read.
+        
+        Args:
+            group_name: Name of the metric group
+            group_config: Configuration dictionary for the group
+
+        Returns:
+            Dictionary mapping MetricIdentifiers to their collected values
+
+        Notes:
+            - Handles both static and command-based metrics
+            - Static metrics don't require command execution
+            - All metrics get proper timestamps and logging
+        """
         self.logger.debug(f"Starting collection for group {group_name}")
         
         try:
-            # Get the source data for the group
-            command = group_config.get('command')
-            if not command:
-                self.logger.debug(f"No command specified for group {group_name}")
-                return {}
-
-            result = await self.command_executor.execute_command(
-                command,
-                self.user_context
-            )
-
-            source_data = result.output if result.success else None
-            if source_data is None:
-                self.logger.debug(f"No source data for group {group_name}")
-                return {}
-
             results = {}
+            command_output = None
+            
+            # Execute command if present (needed for non-static metrics)
+            command = group_config.get('command')
+            if command:
+                result = await self.command_executor.execute_command(
+                    command,
+                    self.user_context
+                )
+                command_output = result.output if result.success else None
+                if command_output is None and result.error_message:
+                    self.logger.error(
+                        f"Command execution failed for group {group_name}: {result.error_message}"
+                    )
+                elif command_output is None:
+                    self.logger.debug(f"No source data for group {group_name}")
+
+            # Process all metrics in the group
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
                     metric_type = MetricType.from_config(metric_config)
@@ -1459,15 +1483,32 @@ class ServiceMetricsCollector:
                         description=metric_config.get('description', f'Metric {metric_name}')
                     )
 
-                    value = self._parse_metric_value(source_data, metric_config, metric_type)
+                    # Validate that non-static metrics have command output
+                    if metric_type != MetricType.STATIC and command_output is None:
+                        if 'value_on_error' in metric_config:
+                            value = metric_config['value_on_error']
+                            self.logger.debug(
+                                f"Using error value {value} for metric {metric_name} "
+                                f"due to missing command output"
+                            )
+                            results[identifier] = value
+                        continue
+
+                    value = self._parse_metric_value(command_output, metric_config, metric_type)
                     if value is not None:
                         results[identifier] = value
+                        self.logger.debug(
+                            f"Collected metric {metric_name} = {value}"
+                        )
 
                 except Exception as e:
-                    self.logger.error(f"Failed to parse metric {metric_name}: {e}")
+                    self.logger.error(
+                        f"Failed to parse metric {metric_name}: {e}"
+                    )
                     
+            self.logger.debug(f"Group {group_name} collection results: {results}")
             return results
-                
+                    
         except Exception as e:
             self.logger.error(f"Failed to collect group {group_name}: {e}")
             return {}
