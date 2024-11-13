@@ -1018,8 +1018,8 @@ class MetricIdentifier:
     group: str
     name: str
     group_type: MetricGroupType
-    type: Optional[MetricType] = None  # Optional because static metrics don't need a type
     description: str
+    type: Optional[MetricType] = None  # Optional because static metrics don't need a type
 
     @property
     def prometheus_name(self) -> str:
