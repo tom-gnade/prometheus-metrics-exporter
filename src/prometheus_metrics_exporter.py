@@ -187,7 +187,7 @@ class ProgramConfig:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _running_under_systemd: bool = field(init=False)
 
-    REQUIRED_SECTIONS = {'exporter', 'services'}
+    REQUIRED_SECTIONS = {'services'}
     DEFAULT_VALUES = {
         'exporter': {
             'metrics_port': 9101,
@@ -293,11 +293,18 @@ class ProgramConfig:
     def _merge_defaults(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Merge configuration with default values."""
         result = deepcopy(self.DEFAULT_VALUES)
-        for key, value in config.items():
-            if isinstance(value, dict) and key in result:
-                result[key].update(value)
-            else:
-                result[key] = value
+
+        # Only merge exporter section if present
+        if 'exporter' in config:
+            for key, value in config['exporter'].items():
+                if isinstance(value, dict) and key in result['exporter']:
+                    result['exporter'][key].update(value)
+                else:
+                    result['exporter'][key] = value
+        
+        # Services section is required and not defaulted
+        result['services'] = config['services']
+        
         return result
 
     def _validate_metric_config(self, metric_name: str, metric_config: Dict[str, Any]) -> None:
@@ -339,34 +346,59 @@ class ProgramConfig:
         if not config:
             raise MetricConfigurationError("Empty configuration")
             
-        if missing := self.REQUIRED_SECTIONS - set(config):
-            raise MetricConfigurationError(f"Missing required sections: {missing}")
-            
-        # Validate exporter section
-        exporter = config.get('exporter', {})
-        if not isinstance(exporter.get('metrics_port', 0), int):
-            raise MetricConfigurationError("Metrics port must be an integer")
-            
-        collection = exporter.get('collection', {})
-        if not isinstance(collection.get('poll_interval_sec', 0), (int, float)):
-            raise MetricConfigurationError("Poll interval must be a number")
-            
-        # Validate services section
-        services = config.get('services', {})
+        # Validate required services section
+        if 'services' not in config:
+            raise MetricConfigurationError("Missing required 'services' section")
+        
+        services = config['services']
         if not isinstance(services, dict):
-            raise MetricConfigurationError("Services must be a dictionary")
+            raise MetricConfigurationError("Services section must be a dictionary")
             
+        if not services:
+            raise MetricConfigurationError("At least one service must be defined")
+        
+        # Validate each service has at least one metric group with metrics
         for service_name, service_config in services.items():
             if not isinstance(service_config, dict):
                 raise MetricConfigurationError(
                     f"Service {service_name} configuration must be a dictionary"
                 )
 
-        # Validate metrics configuration
-        for service_name, service_config in services.items():
-            for group_name, group_config in service_config.get('metric_groups', {}).items():
-                for metric_name, metric_config in group_config.get('metrics', {}).items():
+            metric_groups = service_config.get('metric_groups', {})
+            if not metric_groups:
+                raise MetricConfigurationError(
+                    f"Service '{service_name}' must define at least one metric group"
+                )
+                
+            for group_name, group_config in metric_groups.items():
+                if not isinstance(group_config, dict):
+                    raise MetricConfigurationError(
+                        f"Metric group '{group_name}' in service '{service_name}' "
+                        "must be a dictionary"
+                    )
+                    
+                metrics = group_config.get('metrics', {})
+                if not metrics:
+                    raise MetricConfigurationError(
+                        f"Metric group '{group_name}' in service '{service_name}' "
+                        "must define at least one metric"
+                    )
+                    
+                for metric_name, metric_config in metrics.items():
                     self._validate_metric_config(metric_name, metric_config)
+
+            # Validate optional exporter section if present
+        if 'exporter' in config:
+            exporter = config['exporter']
+            if not isinstance(exporter.get('metrics_port', 0), int):
+                raise MetricConfigurationError("Metrics port must be an integer")
+
+            if not isinstance(exporter.get('health_port', 0), int):
+                raise MetricConfigurationError("Health check port must be an integer")
+
+            collection = exporter.get('collection', {})
+            if not isinstance(collection.get('poll_interval_sec', 0), (int, float)):
+                raise MetricConfigurationError("Poll interval must be a number")
 
     def load(self) -> None:
         """Load configuration from file with thread safety."""
@@ -374,6 +406,8 @@ class ProgramConfig:
             try:
                 with open(self._source.config_path) as f:
                     config = yaml.safe_load(f)
+                    if config is None:
+                        raise MetricConfigurationError("Empty configuration file")
                 
                 self._validate_config(config)
                 config = self._merge_defaults(config)

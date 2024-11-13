@@ -7,7 +7,7 @@
 # - summary  : Basic statistics about values (not supported)
 # - histogram: Distribution of values in buckets (not supported)
 
-# Exporter Configuration
+# Exporter Configuration (optional)
 exporter:
     metrics_port: 9101
     health_port: 9102
@@ -16,7 +16,7 @@ exporter:
     logging:
         level: "DEBUG"
 
-# Services Configuration
+# Services Configuration (required)
 services:
     algorand_node:
         description: "Algorand node services"
