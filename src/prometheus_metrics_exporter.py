@@ -234,58 +234,36 @@ class ProgramSource:
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
 class ProgramConfig:
-    """Program configuration with dynamic reloading support.
+    """Program configuration with simplified defaults and validation."""
     
-    All timestamps in this application are in UTC. The now_utc() method
-    should be used to get the current time, and all stored timestamps
-    should be UTC-aware datetime objects.
+    # Default values as class attributes - explicit and easy to maintain
+    DEFAULT_METRICS_PORT = 9101
+    DEFAULT_HEALTH_PORT = 9102
+    DEFAULT_EXPORTER_USER = 'prometheus'
+    DEFAULT_POLL_INTERVAL = 5
+    DEFAULT_MAX_WORKERS = 4
+    DEFAULT_FAILURE_THRESHOLD = 20
+    DEFAULT_COLLECTION_TIMEOUT = 30
     
-    Configuration is divided into two sections:
-    - exporter: Static configuration that requires service restart to modify
-    - services: Dynamic configuration that supports runtime changes
-    
-    Features:
-    - Optimistic validation of service configurations
-    - Graceful handling of partial configuration failures
-    - Detailed validation reporting and statistics
-    - Automatic rollback on validation failures
-    - Clear warning messages for ignored exporter changes
-    """
-
-    REQUIRED_SECTIONS = {'services'}
-    DEFAULT_VALUES = {
-        'exporter': {
-            'metrics_port': 9101,
-            'health_port': 9102,
-            'user': 'prometheus',
-            'collection': {
-                'poll_interval_sec': 5,
-                'max_workers': 4,
-                'failure_threshold': 20,
-                'collection_timeout_sec': 30
-            },
-            'logging': {
-                'level': 'DEBUG',
-                'file_level': 'DEBUG',
-                'console_level': 'INFO',
-                'journal_level': 'WARNING',
-                'max_bytes': 10485760,  # 10MB
-                'backup_count': 3,
-                'format': '%(asctime)s [%(process)d] [%(threadName)s] [%(name)s.%(funcName)s] [%(levelname)s] %(message)s',
-                'date_format': '%Y-%m-%d %H:%M:%S'
-            }
-        }
-    }
+    # Logging defaults
+    DEFAULT_LOG_LEVEL = 'DEBUG'
+    DEFAULT_LOG_FILE_LEVEL = 'DEBUG'
+    DEFAULT_LOG_CONSOLE_LEVEL = 'INFO'
+    DEFAULT_LOG_JOURNAL_LEVEL = 'WARNING'
+    DEFAULT_LOG_MAX_BYTES = 10485760  # 10MB
+    DEFAULT_LOG_BACKUP_COUNT = 3
+    DEFAULT_LOG_FORMAT = '%(asctime)s [%(process)d] [%(threadName)s] [%(name)s.%(funcName)s] [%(levelname)s] %(message)s'
+    DEFAULT_LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
     def __init__(self, source: ProgramSource):
         """Initialize configuration manager."""
         self._source = source
-        self._config: Dict[str, Any] = {}
-        self._initial_exporter: Dict[str, Any] = {}
-        self._last_load_time: float = self._source.config_path.stat().st_mtime
-        self._lock: threading.Lock = threading.Lock()
-        self._running_under_systemd: bool = bool(os.getenv('INVOCATION_ID'))
-        self._start_time: datetime = self.now_utc()
+        self._config = {'exporter': self._get_exporter_defaults()}
+        self._initial_exporter = {}
+        self._last_load_time = self._source.config_path.stat().st_mtime
+        self._lock = threading.Lock()
+        self._running_under_systemd = bool(os.getenv('INVOCATION_ID'))
+        self._start_time = self.now_utc()
         self.logger = None
         
         # Track validation status
@@ -294,211 +272,129 @@ class ProgramConfig:
             'groups': {'valid': 0, 'invalid': 0},
             'metrics': {'valid': 0, 'invalid': 0}
         }
-        
-        # Load base config for logger setup
-        with open(self._source.config_path) as f:
-            base_config = yaml.safe_load(f) or {}
-        
-        # Set up initial logging config
-        self._config = self._merge_defaults(base_config)
 
-        # Now we can create the logger
-        logger_instance = ProgramLogger(source, self)
-        self.logger = logger_instance.logger
-        
-        # Store initial exporter config
-        self._initial_exporter = deepcopy(self._config.get('exporter', {}))
-        
-        # Now perform full load with validation
-        self.load(initial_load=True)
+    def _log_message(self, level: str, message: str) -> None:
+        """Safe logging wrapper."""
+        if self.logger:
+            getattr(self.logger, level)(message)
 
-    def _merge_defaults(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge configuration with default values."""
-        result = deepcopy(self.DEFAULT_VALUES)
+    def initialize(self) -> None:
+        """Complete initialization after logger is attached."""
+        try:
+            self.load(initial_load=True)
+        except Exception as e:
+            self._log_message('error', f"Failed to load initial configuration: {e}")
+            raise
 
-        # Ensure logging defaults are preserved
-        if 'exporter' in config:
-            if 'logging' in config['exporter']:
-                result['exporter']['logging'] = self._merge_dicts(
-                    result['exporter']['logging'],
-                    config['exporter']['logging']
-                )
-            for key, value in config['exporter'].items():
-                if key != 'logging':  # Skip logging as we handled it above
-                    if isinstance(value, dict) and key in result['exporter']:
-                        result['exporter'][key] = self._merge_dicts(
-                            result['exporter'][key],
-                            value
-                        )
-                    else:
-                        result['exporter'][key] = deepcopy(value)
-        
-        # Services section is required and not defaulted
-        result['services'] = config.get('services', {})
-        
-        return result
-
-    def _merge_dicts(self, default: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-        """Recursively merge two dictionaries.
-        
-        Args:
-            default: Base dictionary containing default values
-            override: Dictionary containing override values
-        
-        Returns:
-            New dictionary with merged values
-        """
-        result = deepcopy(default)
-        
-        for key, value in override.items():
-            if (
-                key in result and
-                isinstance(result[key], dict) and
-                isinstance(value, dict)
-            ):
-                result[key] = self._merge_dicts(result[key], value)
-            else:
-                result[key] = deepcopy(value)
-                
-        return result
+    def _get_exporter_defaults(self) -> Dict[str, Any]:
+        """Get default exporter configuration."""
+        return {
+            'metrics_port': self.DEFAULT_METRICS_PORT,
+            'health_port': self.DEFAULT_HEALTH_PORT,
+            'user': self.DEFAULT_EXPORTER_USER,
+            'collection': {
+                'poll_interval_sec': self.DEFAULT_POLL_INTERVAL,
+                'max_workers': self.DEFAULT_MAX_WORKERS,
+                'failure_threshold': self.DEFAULT_FAILURE_THRESHOLD,
+                'collection_timeout_sec': self.DEFAULT_COLLECTION_TIMEOUT
+            },
+            'logging': {
+                'level': self.DEFAULT_LOG_LEVEL,
+                'file_level': self.DEFAULT_LOG_FILE_LEVEL,
+                'console_level': self.DEFAULT_LOG_CONSOLE_LEVEL,
+                'journal_level': self.DEFAULT_LOG_JOURNAL_LEVEL,
+                'max_bytes': self.DEFAULT_LOG_MAX_BYTES,
+                'backup_count': self.DEFAULT_LOG_BACKUP_COUNT,
+                'format': self.DEFAULT_LOG_FORMAT,
+                'date_format': self.DEFAULT_LOG_DATE_FORMAT
+            }
+        }
 
     def _reset_validation_stats(self):
-        """Reset validation statistics.
-        
-        Tracks success/failure counts for:
-        - Services: Total services validated
-        - Groups: Total metric groups across all services
-        - Metrics: Individual metrics across all groups
-        """
+        """Reset validation statistics."""
         for section in self._validation_stats.values():
             section['valid'] = 0
             section['invalid'] = 0
 
     def load(self, initial_load: bool = False) -> None:
-        """Load configuration with thread safety and validation.
-
-        Handles two distinct cases:
-        1. Initial Load (initial_load=True):
-           - Full validation of all sections
-           - Failure raises MetricConfigurationError
-           - Stores initial exporter configuration
-        
-        2. Runtime Reload (initial_load=False):
-           - Ignores exporter section changes
-           - Optimistically validates services
-           - Maintains previous config on failures
-           - Provides detailed validation feedback
-        
-        Args:
-            initial_load: Whether this is the first configuration load
-            
-        Raises:
-            MetricConfigurationError: On initial load failures
-        """
+        """Load configuration with simplified validation."""
         with self._lock:
             try:
                 self._reset_validation_stats()
                 
-                with open(self._source.config_path) as f:
-                    config = yaml.safe_load(f)
-                    if config is None:
-                        raise MetricConfigurationError("Empty configuration file")
-                
-                # Keep previous config for rollback
-                previous_config = deepcopy(self._config)
-                
+                # Start with default values
+                new_config = {
+                    'exporter': self._get_exporter_defaults(),
+                    'services': {}
+                }
+
+                # Load configuration file
                 try:
-                    # Start with default values
-                    validated = deepcopy(self.DEFAULT_VALUES)
-                    
-                    # Handle exporter section statically after initial load
-                    validated['exporter'] = self._validate_exporter(
-                        config.get('exporter', {}), 
-                        initial_load
-                    )
-
-                    # Handle services section with optimistic parsing
-                    if 'services' not in config:
-                        raise MetricConfigurationError("Missing required 'services' section")
-                    
-                    validated['services'] = self._validate_services(
-                        config['services'],
-                        previous_config.get('services', {}) if not initial_load else {}
-                    )
-
-                    # Update configuration and timestamp
-                    self._config = validated
-                    self._last_load_time = self._source.config_path.stat().st_mtime
-                    
-                    # Log validation summary
-                    self._log_validation_summary(initial_load)
-                    
+                    with open(self._source.config_path) as f:
+                        file_config = yaml.safe_load(f) or {}
                 except Exception as e:
-                    if initial_load:
-                        raise
-                    self._config = previous_config
-                    self.logger.error(f"Failed to validate configuration: {e}")
-                    self.logger.info("Continuing with previous configuration")
+                    raise MetricConfigurationError(f"Failed to load config file: {e}")
+
+                if initial_load:
+                    # Validate and merge exporter section
+                    if 'exporter' in file_config:
+                        self._validate_exporter_section(file_config['exporter'])
+                        # Merge while preserving defaults for missing values
+                        new_config['exporter'] = self._merge_with_defaults(
+                            new_config['exporter'],
+                            file_config['exporter']
+                        )
+                    self._initial_exporter = deepcopy(new_config['exporter'])
+                else:
+                    # Use initial exporter config after first load
+                    new_config['exporter'] = deepcopy(self._initial_exporter)
+
+                # Validate services section
+                if 'services' not in file_config:
+                    raise MetricConfigurationError("Missing required 'services' section")
+                
+                # Validate and store services
+                new_config['services'] = self._validate_services(file_config['services'])
+
+                # Update configuration
+                self._config = new_config
+                self._last_load_time = self._source.config_path.stat().st_mtime
+                
+                # Log validation summary
+                self._log_validation_summary(initial_load)
 
             except Exception as e:
                 if initial_load:
                     raise MetricConfigurationError(f"Failed to load initial config: {e}")
-                self.logger.error(
-                    f"Failed to reload configuration: {e}. "
-                    "Continuing with previous configuration."
-                )
+                if self.logger:
+                    self.logger.error(f"Failed to reload configuration: {e}")
 
-    def _validate_exporter(
-        self, 
-        exporter_config: Dict[str, Any],
-        initial_load: bool
-    ) -> Dict[str, Any]:
-        """Validate exporter section."""
-        if initial_load:
-            if not isinstance(exporter_config, dict):
-                raise MetricConfigurationError("Exporter section must be a dictionary")
-                
-            # Validate ports
-            metrics_port = exporter_config.get('metrics_port', 0)
-            health_port = exporter_config.get('health_port', 0)
-            
-            if not isinstance(metrics_port, int) or metrics_port < 1 or metrics_port > 65535:
-                raise MetricConfigurationError(
-                    f"Invalid metrics_port {metrics_port}: must be between 1-65535"
-                )
-                
-            if not isinstance(health_port, int) or health_port < 1 or health_port > 65535:
-                raise MetricConfigurationError(
-                    f"Invalid health_port {health_port}: must be between 1-65535"
-                )
-                
-            if metrics_port == health_port:
-                raise MetricConfigurationError(
-                    f"metrics_port ({metrics_port}) and health_port ({health_port}) "
-                    "must be different"
-                )
-            
-            return deepcopy(exporter_config)
-        else:
-            # Compare with initial config
-            if exporter_config != self._initial_exporter:
-                changed_fields = [
-                    k for k, v in exporter_config.items()
-                    if self._initial_exporter.get(k) != v
-                ]
-                if changed_fields:
-                    self.logger.warning(
-                        f"Changes detected in exporter section fields: {', '.join(changed_fields)}. "
-                        "These changes will be ignored. Restart the service to apply changes."
-                    )
-            # Always keep initial exporter config after first load
-            return deepcopy(self._initial_exporter)
+    def _merge_with_defaults(self, defaults: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        """Simple merge of override values with defaults."""
+        result = deepcopy(defaults)
+        for key, value in override.items():
+            if isinstance(value, dict) and key in result and isinstance(result[key], dict):
+                result[key] = self._merge_with_defaults(result[key], value)
+            else:
+                result[key] = deepcopy(value)
+        return result
 
-    def _validate_services(
-        self,
-        services_config: Dict[str, Any],
-        previous_services: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def _validate_exporter_section(self, config: Dict[str, Any]) -> None:
+        """Basic validation of exporter configuration."""
+        # Validate ports
+        metrics_port = config.get('metrics_port', self.DEFAULT_METRICS_PORT)
+        health_port = config.get('health_port', self.DEFAULT_HEALTH_PORT)
+        
+        if not isinstance(metrics_port, int) or metrics_port < 1 or metrics_port > 65535:
+            raise MetricConfigurationError(f"Invalid metrics_port {metrics_port}")
+            
+        if not isinstance(health_port, int) or health_port < 1 or health_port > 65535:
+            raise MetricConfigurationError(f"Invalid health_port {health_port}")
+            
+        if metrics_port == health_port:
+            raise MetricConfigurationError("metrics_port and health_port must be different")
+
+    def _validate_services(self, services_config: Dict[str, Any]) -> Dict[str, Any]:
         """Validate services section with optimistic parsing."""
         if not isinstance(services_config, dict):
             raise MetricConfigurationError("Services section must be a dictionary")
@@ -515,18 +411,13 @@ class ProgramConfig:
                     self._validation_stats['services']['invalid'] += 1
             except Exception as e:
                 self._validation_stats['services']['invalid'] += 1
-                self.logger.warning(
-                    f"Failed to validate service '{service_name}': {e}. "
-                    "Skipping this service but continuing with others."
-                )
+                if self.logger:
+                    self.logger.warning(
+                        f"Failed to validate service '{service_name}': {e}. "
+                        "Skipping this service but continuing with others."
+                    )
 
         if not validated_services:
-            if previous_services:
-                self.logger.error(
-                    "No valid services found in new configuration. "
-                    "Keeping previous service configuration."
-                )
-                return previous_services
             raise MetricConfigurationError("No valid services found in configuration")
             
         return validated_services
@@ -536,23 +427,7 @@ class ProgramConfig:
         service_name: str,
         service_config: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        """Validate service configuration optimistically.
-        
-        Attempts to validate and retain as much working configuration as possible.
-        Invalid components are skipped with warnings rather than failing completely.
-        
-        Args:
-            service_name: Name of service being validated
-            service_config: Raw service configuration dictionary
-        
-        Returns:
-            Validated service configuration or None if no valid components
-            
-        Validation Steps:
-        1. Validate basic service properties (description, run_as)
-        2. Validate each metric group independently
-        3. Track validation statistics for reporting
-        """
+        """Validate service configuration."""
         if not isinstance(service_config, dict):
             raise MetricConfigurationError(
                 f"Service '{service_name}' configuration must be a dictionary"
@@ -565,15 +440,13 @@ class ProgramConfig:
             if key in service_config:
                 validated[key] = service_config[key]
 
-        # Handle metric groups optimistically
+        # Handle metric groups
         if 'metric_groups' not in service_config:
             raise MetricConfigurationError(
                 f"No metric groups defined for service '{service_name}'"
             )
 
         validated['metric_groups'] = {}
-        valid_groups = 0
-        invalid_groups = 0
         
         for group_name, group_config in service_config['metric_groups'].items():
             try:
@@ -584,25 +457,20 @@ class ProgramConfig:
                 )
                 if validated_group:
                     validated['metric_groups'][group_name] = validated_group
-                    valid_groups += 1
                     self._validation_stats['groups']['valid'] += 1
                 else:
-                    invalid_groups += 1
                     self._validation_stats['groups']['invalid'] += 1
             except Exception as e:
                 self._validation_stats['groups']['invalid'] += 1
-                self.logger.warning(
-                    f"Failed to validate group '{group_name}' in service '{service_name}': {e}"
-                )
+                if self.logger:
+                    self.logger.warning(
+                        f"Failed to validate group '{group_name}' in service '{service_name}': {e}"
+                    )
 
-        # Return service if it has any valid groups
-        if valid_groups > 0:
-            return validated
+        if not validated['metric_groups']:
+            raise MetricConfigurationError(f"No valid metric groups in service '{service_name}'")
             
-        raise MetricConfigurationError(
-            f"No valid metric groups in service '{service_name}' "
-            f"(attempted to parse {invalid_groups} groups)"
-        )
+        return validated
 
     def _validate_metric_group(
         self,
@@ -610,13 +478,13 @@ class ProgramConfig:
         group_name: str,
         group_config: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        """Validate metric group configuration optimistically."""
+        """Validate metric group configuration."""
         if not isinstance(group_config, dict):
             raise MetricConfigurationError("Must be a dictionary")
 
         validated = {}
         
-        # First validate all metrics to determine if command is required
+        # Validate metrics first to determine if command is required
         validated['metrics'] = {}
         static_metrics_only = True
         
@@ -637,18 +505,16 @@ class ProgramConfig:
                     self._validation_stats['metrics']['invalid'] += 1
             except Exception as e:
                 self._validation_stats['metrics']['invalid'] += 1
-                self.logger.warning(
-                    f"Failed to validate metric '{metric_name}': {e}"
-                )
+                if self.logger:
+                    self.logger.warning(
+                        f"Failed to validate metric '{metric_name}': {e}"
+                    )
 
-        # Ensure we have required components
         if not validated['metrics']:
             raise MetricConfigurationError("No valid metrics defined")
             
         if not static_metrics_only and 'command' not in group_config:
-            raise MetricConfigurationError(
-                "Command required for non-static metrics"
-            )
+            raise MetricConfigurationError("Command required for non-static metrics")
 
         # Copy group properties
         for field in ['command', 'content_type', 'collection_frequency']:
@@ -713,17 +579,10 @@ class ProgramConfig:
             raise MetricConfigurationError(f"Invalid metric configuration: {e}")
 
     def _log_validation_summary(self, initial_load: bool) -> None:
-        """Log validation statistics summary.
-        
-        Provides detailed feedback about configuration validation:
-        - Total services/groups/metrics validated
-        - Success/failure counts at each level
-        - Clear warnings about any validation issues
-        - Differentiated messages for initial load vs reload
-        
-        Args:
-            initial_load: Whether this is the first configuration load
-        """
+        """Log validation statistics summary."""
+        if not self.logger:
+            return
+            
         stats = self._validation_stats
         
         # Calculate totals
@@ -761,65 +620,79 @@ class ProgramConfig:
             if current_mtime > self._last_load_time:
                 self.load()
         except Exception as e:
-            self.logger.error(f"Failed to check configuration reload: {e}")
+            if self.logger:
+                self.logger.error(f"Failed to check configuration reload: {e}")
 
-    # Standard properties from original implementation
     @staticmethod
     def now_utc() -> datetime:
+        """Get current UTC datetime."""
         return datetime.now(timezone.utc)
 
     def get_uptime_seconds(self) -> float:
+        """Get service uptime in seconds."""
         return (self.now_utc() - self._start_time).total_seconds()
 
     @property
     def exporter_user(self) -> str:
-        return self.exporter.get('user', 'prometheus')
+        """Get exporter user."""
+        return self.exporter.get('user', self.DEFAULT_EXPORTER_USER)
 
     @property
     def running_under_systemd(self) -> bool:
+        """Check if running under systemd."""
         return self._running_under_systemd
 
     @property
     def collection_timeout(self) -> int:
-        return self.collection.get('collection_timeout_sec', 30)
+        """Get collection timeout in seconds."""
+        return self.collection.get('collection_timeout_sec', self.DEFAULT_COLLECTION_TIMEOUT)
 
     @property
     def exporter(self) -> Dict[str, Any]:
+        """Get exporter configuration."""
         self._check_reload()
         return self._config['exporter']
     
     @property
     def services(self) -> Dict[str, Any]:
+        """Get services configuration."""
         self._check_reload()
         return self._config['services']
 
     @property
     def logging(self) -> Dict[str, Any]:
+        """Get logging configuration."""
         return self.exporter.get('logging', {})
 
     @property
     def collection(self) -> Dict[str, Any]:
+        """Get collection configuration."""
         return self.exporter.get('collection', {})
     
     @property
     def metrics_port(self) -> int:
-        return self.exporter['metrics_port']
+        """Get metrics port number."""
+        return self.exporter.get('metrics_port', self.DEFAULT_METRICS_PORT)
     
     @property
     def health_port(self) -> int:
-        return self.exporter['health_port']
+        """Get health check port number."""
+        return self.exporter.get('health_port', self.DEFAULT_HEALTH_PORT)
     
     @property
     def poll_interval(self) -> int:
-        return self.collection.get('poll_interval_sec', 5)
+        """Get polling interval in seconds."""
+        return self.collection.get('poll_interval_sec', self.DEFAULT_POLL_INTERVAL)
     
     @property
     def max_workers(self) -> int:
-        return self.collection.get('max_workers', 4)
+        """Get maximum number of worker threads."""
+        return self.collection.get('max_workers', self.DEFAULT_MAX_WORKERS)
     
     @property
     def failure_threshold(self) -> int:
-        return self.collection.get('failure_threshold', 20)
+        """Get failure threshold count."""
+        return self.collection.get('failure_threshold', self.DEFAULT_FAILURE_THRESHOLD)
 
     def get_service(self, name: str) -> Optional[Dict[str, Any]]:
         """Get service configuration by name."""
@@ -830,16 +703,25 @@ class ProgramConfig:
 
 class ProgramLogger:
     """Manages logging configuration and setup."""
-
+    
     def __init__(
         self,
         source: ProgramSource,
         config: ProgramConfig
     ):
+        """Initialize logging configuration.
+        
+        Args:
+            source: Program source information
+            config: Program configuration
+        """
         self.source = source
         self.config = config
-        self._handlers = {}
+        self._handlers: Dict[str, logging.Handler] = {}
         self._logger = self._setup_logging()
+
+        # Attach logger to config after setup
+        self.config.logger = self._logger
 
     @property
     def logger(self) -> logging.Logger:
@@ -855,9 +737,127 @@ class ProgramLogger:
     def handlers(self) -> Dict[str, logging.Handler]:
         """Get dictionary of configured handlers."""
         return self._handlers
-    
+
+    def _get_logging_config(self) -> Dict[str, Any]:
+        """Safely get logging configuration with defaults.
+        
+        Returns a complete logging configuration dictionary, using values from:
+        1. User configuration in YAML file
+        2. ProgramConfig default values
+        """
+        try:
+            exporter_config = self.config._config.get('exporter', {})
+            logging_config = exporter_config.get('logging', {})
+            
+            return {
+                'level': logging_config.get('level', self.config.DEFAULT_LOG_LEVEL),
+                'file_level': logging_config.get('file_level', self.config.DEFAULT_LOG_FILE_LEVEL),
+                'console_level': logging_config.get('console_level', self.config.DEFAULT_LOG_CONSOLE_LEVEL),
+                'journal_level': logging_config.get('journal_level', self.config.DEFAULT_LOG_JOURNAL_LEVEL),
+                'max_bytes': logging_config.get('max_bytes', self.config.DEFAULT_LOG_MAX_BYTES),
+                'backup_count': logging_config.get('backup_count', self.config.DEFAULT_LOG_BACKUP_COUNT),
+                'format': logging_config.get('format', self.config.DEFAULT_LOG_FORMAT),
+                'date_format': logging_config.get('date_format', self.config.DEFAULT_LOG_DATE_FORMAT)
+            }
+        except Exception as e:
+            # If there's any error, return defaults from ProgramConfig
+            return {
+                'level': self.config.DEFAULT_LOG_LEVEL,
+                'file_level': self.config.DEFAULT_LOG_FILE_LEVEL,
+                'console_level': self.config.DEFAULT_LOG_CONSOLE_LEVEL,
+                'journal_level': self.config.DEFAULT_LOG_JOURNAL_LEVEL,
+                'max_bytes': self.config.DEFAULT_LOG_MAX_BYTES,
+                'backup_count': self.config.DEFAULT_LOG_BACKUP_COUNT,
+                'format': self.config.DEFAULT_LOG_FORMAT,
+                'date_format': self.config.DEFAULT_LOG_DATE_FORMAT
+            }
+
+    def _get_formatter(self) -> logging.Formatter:
+        """Create formatter using current settings.
+        
+        Returns:
+            Configured logging.Formatter instance
+        """
+        log_settings = self._get_logging_config()
+        return logging.Formatter(
+            log_settings['format'],
+            log_settings['date_format']
+        )
+
+    def _setup_logging(self) -> logging.Logger:
+        """Set up logging with configuration from config file.
+        
+        Creates and configures:
+        - Base logger
+        - File handler with rotation
+        - Console handler
+        - Journal handler (if running under systemd)
+        
+        Returns:
+            Configured logging.Logger instance
+        
+        Note:
+            If handler setup fails, ensures at least basic console logging
+            is available as a fallback.
+        """
+        logger = logging.getLogger(self.source.logger_name)
+        logger.handlers.clear()
+
+        log_settings = self._get_logging_config()
+
+        # Set base logger level
+        logger.setLevel(log_settings['level'])
+        
+        # Create formatter
+        formatter = logging.Formatter(
+            log_settings['format'],
+            log_settings['date_format']
+        )
+        
+        try:
+            # File handler
+            file_handler = RotatingFileHandler(
+                self.source.log_path,
+                maxBytes=log_settings['max_bytes'],
+                backupCount=log_settings['backup_count']
+            )
+            file_handler.setLevel(log_settings['file_level'])
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            self._handlers['file'] = file_handler
+            
+            # Console handler
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(log_settings['console_level'])
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+            self._handlers['console'] = console_handler
+            
+            # Journal handler for systemd
+            if self.config.running_under_systemd:
+                journal_handler = journal.JournaldLogHandler()
+                journal_handler.setLevel(log_settings['journal_level'])
+                journal_handler.setFormatter(formatter)
+                logger.addHandler(journal_handler)
+                self._handlers['journal'] = journal_handler
+
+        except Exception as e:
+            # If handler setup fails, ensure we have at least a basic console handler
+            if not logger.handlers:
+                basic_handler = logging.StreamHandler(sys.stdout)
+                basic_handler.setFormatter(logging.Formatter(self.config.DEFAULT_LOG_FORMAT))
+                logger.addHandler(basic_handler)
+                self._handlers['console'] = basic_handler
+                print(f"Failed to setup handlers: {e}, using basic console handler", file=sys.stderr)
+        
+        return logger
+
     def set_level(self, level: Union[str, int]) -> None:
-        """Set log level for all handlers."""
+        """Set log level for all handlers.
+        
+        Args:
+            level: New log level (can be string name or integer constant)
+        """
         self._logger.setLevel(level)
         for handler in self._logger.handlers:
             handler.setLevel(level)
@@ -882,62 +882,34 @@ class ProgramLogger:
         self._handlers[name] = handler
     
     def remove_handler(self, name: str) -> None:
-        """Remove a handler by name."""
+        """Remove a handler by name.
+        
+        Args:
+            name: Identifier of handler to remove
+        """
         if name in self._handlers:
             self._logger.removeHandler(self._handlers[name])
             del self._handlers[name]
-    
-    def _get_formatter(self) -> logging.Formatter:
-        """Create formatter using current settings."""
-        # Access raw config dictionary instead of using properties
-        log_settings = self.config._config['exporter']['logging']
-        return logging.Formatter(
-            log_settings['format'],
-            log_settings['date_format']
-        )
 
-    def _setup_logging(self) -> logging.Logger:
-        """Set up logging with configuration from config file."""
-        logger = logging.getLogger(self.source.logger_name)
-        logger.handlers.clear()
-
-        # Access raw config dictionary instead of using properties
-        log_settings = self.config._config['exporter']['logging']
-
-        log_level = log_settings['level']
-        logger.setLevel(log_level)
-        formatter = logging.Formatter(
-            log_settings['format'],
-            log_settings['date_format']
-        )
+    def update_config(self) -> None:
+        """Update logging configuration from current config settings.
         
-        # File handler
-        file_handler = RotatingFileHandler(
-            self.source.log_path,
-            maxBytes=log_settings['max_bytes'],
-            backupCount=log_settings['backup_count']
-        )
-        file_handler.setLevel(log_settings['file_level'])
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-        self._handlers['file'] = file_handler
+        Reloads all logging settings from config and updates existing handlers.
+        """
+        log_settings = self._get_logging_config()
+        formatter = self._get_formatter()
         
-        # Console handler
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(log_settings['console_level'])
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-        self._handlers['console'] = console_handler
+        self._logger.setLevel(log_settings['level'])
         
-        # Journal handler for systemd
-        if self.config.running_under_systemd:
-            journal_handler = journal.JournaldLogHandler()
-            journal_handler.setLevel(log_settings['journal_level'])
-            journal_handler.setFormatter(formatter)
-            logger.addHandler(journal_handler)
-            self._handlers['journal'] = journal_handler
-        
-        return logger
+        # Update existing handlers
+        for name, handler in self._handlers.items():
+            handler.setFormatter(formatter)
+            if name == 'file':
+                handler.setLevel(log_settings['file_level'])
+            elif name == 'console':
+                handler.setLevel(log_settings['console_level'])
+            elif name == 'journal':
+                handler.setLevel(log_settings['journal_level'])
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -2093,21 +2065,47 @@ class MetricsExporter:
             return False
 
     async def _cleanup_async(self):
-        """Asynchronous cleanup of resources."""
+        """Asynchronous cleanup of resources with proper resource cleanup."""
         if not self._servers_started:
             return
         
         try:
-            # Stop servers in reverse order of startup
+            # 1. Stop accepting new metrics collections
+            self.logger.info("Stopping metric collections...")
+            if hasattr(self.metrics_collector, '_semaphore'):
+                # Prevent new collections from starting
+                self.metrics_collector._semaphore._value = 0
+                
+            # 2. Allow pending collections to finish (with timeout matching poll interval)
+            try:
+                pending = [task for task in asyncio.all_tasks() 
+                        if not task.done() and task != asyncio.current_task()]
+                if pending:
+                    self.logger.info(f"Waiting for {len(pending)} pending tasks...")
+                    await asyncio.wait(pending, timeout=self.config.poll_interval)
+            except asyncio.TimeoutError:
+                self.logger.warning("Some tasks did not complete in time")
+
+            # 3. Stop health check server (which has its own thread)
             if self.health_check:
+                self.logger.info("Stopping health check server...")
                 self.health_check.stop()
-                self.logger.info("Health check server stopped")
+                
+            # 4. Close log handlers explicitly
+            self.logger.info("Closing log handlers...")
+            for handler in self.logger.handlers:
+                try:
+                    handler.close()
+                except Exception as e:
+                    self.logger.error(f"Error closing log handler: {e}")
 
-            # Stop metrics server (no direct way with prometheus_client)
-            self.logger.info("Metrics server will stop with process termination")
-
+            # 5. Notify systemd before final cleanup
             if self.config.running_under_systemd:
                 notify(Notification.STOPPING)
+                
+            # 6. Final cleanup
+            # prometheus_client server will stop with process
+            self.logger.info("Metrics server will stop with process termination")
 
         except Exception as e:
             self.logger.error(f"Error during cleanup: {e}")
@@ -2206,7 +2204,9 @@ async def main():
     try:
         source = ProgramSource()
         config = ProgramConfig(source)
-        logger = ProgramLogger(source, config).logger
+        program_logger = ProgramLogger(source, config)
+        logger = program_logger.logger
+        config.initialize()
 
         try:
             exporter = MetricsExporter(source, config, logger)
@@ -2221,16 +2221,7 @@ async def main():
                     notify(Notification.STOPPING)
             return 0
         
-        except Exception as e:
-            logger.error(f"Failed to start metrics exporter: {e}")
-            if exporter:
-                await exporter._cleanup_async()
-                if exporter.config.running_under_systemd:
-                    notify(Notification.STOPPING)
-            return 1
-
     except Exception as e:
-        # Only use print for catastrophic failures in logger setup
         print(f"Fatal error during startup: {e}", file=sys.stderr)
         if exporter:
             await exporter._cleanup_async()
