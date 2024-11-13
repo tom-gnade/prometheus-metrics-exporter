@@ -14,43 +14,90 @@ A flexible metrics collection and exposition service supporting:
 - Error handling and health checks
 - Automatic user permission management
 
+Usage:
+---------------------
+1. Create a YAML configuration file in the same directory as the script
+2. Ensure proper user permissions are configured
+3. Run the script directly or via systemd service
+4. Monitor metrics at http://localhost:9101/metrics
+5. Check service health at http://localhost:9102/health
+
 Configuration:
 ---------------------
 
 exporter:
     metrics_port: 9101  # Prometheus metrics port
-    health_port: 9102 # Health check port
-    user: prometheus # User to run commands as
+    health_port: 9102   # Health check port
+    user: prometheus    # User to run commands as
     collection:
-        poll_interval_sec: 5  # Global collection interval
-        max_workers: 4  # Parallel collection workers
-        failure_threshold: 20  # Collection failures before unhealthy
-        collection_timeout_sec: 30 # Timeout for collection operations
+        poll_interval_sec: 5    # Global collection interval
+        max_workers: 4          # Parallel collection workers
+        failure_threshold: 20   # Collection failures before unhealthy
+        collection_timeout_sec: 30  # Timeout for collection operations
     logging:
-        level: "DEBUG"  # Main logging level
-        file_level: "DEBUG"  # File logging level
+        level: "DEBUG"         # Main logging level
+        file_level: "DEBUG"    # File logging level
         console_level: "INFO"  # Console output level
         journal_level: "WARNING"  # Systemd journal level
-        max_bytes: 10485760  # Log file size limit
-        backup_count: 3  # Log file rotation count
-        format: "%(asctime)s [%(process)d] [%(threadName)s] [%(name)s.%(funcName)s] [%(levelname)s] %(message)s"  # Log format
-        date_format: "%Y-%m-%d %H:%M:%S"  # Timestamp format
+        max_bytes: 10485760    # Log file size limit (10MB)
+        backup_count: 3        # Log file rotation count
+        format: "%(asctime)s [%(process)d] [%(threadName)s] [%(name)s.%(funcName)s] [%(levelname)s] %(message)s"
+        date_format: "%Y-%m-%d %H:%M:%S"
 
 services:
-    service_name:  # Each service to monitor
+    service_name:              # Each service to monitor
         description: "Service description"
-        run_as:  username # Optional username to execute commands
+        run_as: username       # Optional username to execute commands
         metric_groups:
-            group_name:  # Logical grouping of metrics that share a single command
-                command: "shell command that produces output"  # Command to execute
+            group_name:        # Logical grouping of metrics that share a command
+                command: "shell command that produces output"
+                expose_metrics: true  # Optional, default true
                 metrics:
                     metric_name:
-                        type: "gauge|static|counter" # Required metric type declaration
-                        description: "Metric description"
-                        filter: "regex or jq-style filter"  # Text regex or JSON filter
-                        content_type: "text|json"  # How to parse command output, default text
-                        value: 1.0 # Optional, only specified for "static" metrics
-                        value_on_error: 0.0  # Optional, override value on failure (static or gauge)
+                        type: "gauge|static|counter"  # Required metric type
+                        description: "Metric description"  # Required description
+                        filter: "regex or jq-style filter"  # Required for non-static
+                        content_type: "text|json"  # How to parse output, default text
+                        value: 1.0  # Required for static metrics
+                        value_on_error: 0.0  # Optional fallback value
+
+Health Check API:
+---------------------
+GET /health
+Returns service health status and operational metrics
+
+Query Parameters:
+    include_metrics=true: Include full metrics inventory
+
+Response Codes:
+    200: Service healthy
+    503: Service unhealthy
+    404: Invalid endpoint
+
+Features:
+---------------------
+- Dynamic configuration reloading
+- Parallel metric collection
+- User context switching for command execution
+- Prometheus metrics exposition
+- Health check endpoint with detailed status
+- Comprehensive logging with rotation
+- Systemd integration
+- Automatic sudo permission management
+
+Dependencies:
+---------------------
+- Python 3.11+
+- prometheus_client
+- pyyaml
+- cysystemd (for systemd integration)
+
+Notes:
+---------------------
+- All timestamps are in UTC
+- Configuration file must be in same directory as script
+- Script must run as root for user switching functionality
+- Proper sudo rules are required for user context switching
 """
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
@@ -83,16 +130,15 @@ from typing import (
     Awaitable, Any, Dict, List, Optional, 
     TYPE_CHECKING, Union
 )
+from wsgiref.simple_server import make_server
 
 # Third party imports
 from prometheus_client import (
    Counter, Gauge, make_wsgi_app, start_http_server
 )
-from wsgiref.simple_server import make_server
 from cysystemd.daemon import notify, Notification
 from cysystemd import journal
 import yaml
-import requests
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Core Exceptions
@@ -406,11 +452,17 @@ class ProgramConfig:
             # Validate optional exporter section if present
         if 'exporter' in config:
             exporter = config['exporter']
-            if not isinstance(exporter.get('metrics_port', 0), int):
-                raise MetricConfigurationError("Metrics port must be an integer")
+            metrics_port = exporter.get('metrics_port', 0)
+            health_port = exporter.get('health_port', 0)
 
-            if not isinstance(exporter.get('health_port', 0), int):
-                raise MetricConfigurationError("Health check port must be an integer")
+            if not isinstance(metrics_port, int) or metrics_port < 1 or metrics_port > 65535:
+                raise MetricConfigurationError("Metrics port must be a valid port number (1-65535)")
+
+            if not isinstance(health_port, int) or health_port < 1 or health_port > 65535:
+                raise MetricConfigurationError("Health check port must be a valid port number (1-65535)")
+
+            if metrics_port == health_port:
+                raise MetricConfigurationError("Metrics and health check ports must be different")
 
             collection = exporter.get('collection', {})
             if not isinstance(collection.get('poll_interval_sec', 0), (int, float)):
@@ -653,7 +705,21 @@ class CollectionResult:
 
 @dataclass
 class CollectionStats:
-    """Statistics for metric collection operations."""
+    """Statistics for metric collection operations.
+    
+    Tracks metrics collection success/failure rates and timing information
+    for health monitoring and operational visibility.
+    
+    Attributes:
+        attempts (int): Total collection attempts
+        successful (int): Successful collections
+        warnings (int): Collection warnings
+        errors (int): Collection errors
+        consecutive_failures (int): Current streak of failures
+        last_collection_time (float): Duration of last collection
+        total_collection_time (float): Cumulative collection time
+        last_collection_datetime (datetime): Timestamp of last collection
+    """
     attempts: int = 0
     successful: int = 0
     warnings: int = 0
@@ -977,7 +1043,24 @@ class CollectionManager:
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
 class ServiceMetricsCollector:
-    """Collects metrics for a specific service."""
+    """Collects metrics for a specific service.
+    
+    Handles metric collection for a single service, including:
+    - Command execution with user context
+    - Output parsing and value extraction
+    - Error handling and logging
+    
+    Args:
+        service_name (str): Name of service to monitor
+        service_config (Dict[str, Any]): Service configuration
+        logger (logging.Logger): Logger instance
+        config (ProgramConfig): Program configuration
+    
+    Notes:
+        - Commands run with specified user context if run_as configured
+        - Supports both text and JSON output parsing
+        - Handles errors gracefully with optional fallback values
+    """
     
     def __init__(
         self,
@@ -1283,11 +1366,268 @@ class MetricsCollector:
         self._internal_metrics['last_collection_unix_seconds'].set(collection_time)
     
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+# Health Check Endpoint
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
+class HealthCheck:
+    """Health check endpoint implementation.
+    
+    Provides HTTP endpoint for monitoring service health and getting
+    operational metrics. Implements a REST API with JSON responses.
+    
+    Endpoints:
+        GET /health: Service health status
+        GET /health?include_metrics=true: Status with metrics inventory
+    
+    Response Format:
+        {
+            "service": {
+                "status": "healthy|unhealthy",
+                "up": true,
+                ...
+            },
+            "stats": {
+                "collection": {...},
+                "configuration": {...}
+            },
+            "files": {...},
+            "metrics": {...}  # If requested
+        }
+    """
+
+    def __init__(
+        self, 
+        config: ProgramConfig,
+        metrics_collector: MetricsCollector,
+        logger: logging.Logger
+    ):
+        self.config = config
+        self.metrics_collector = metrics_collector
+        self.logger = logger
+        self._server = None
+        self._thread = None
+
+    def start(self) -> bool:
+        """Start health check server in a separate thread."""
+        try:
+            app = self._create_wsgi_app()
+            self._server = make_server('', self.config.health_port, app)
+            self._thread = threading.Thread(
+                target=self._server.serve_forever,
+                name="HealthCheckServer",
+                daemon=True
+            )
+            self._thread.start()
+            self.logger.info(f"Started health check server on port {self.config.health_port}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to start health check server: {e}")
+            return False
+
+    def stop(self) -> None:
+        """Stop health check server."""
+
+        if not self._server:
+            return
+
+        try:
+            self.logger.info("Stopping health check server")
+            self._server.shutdown()
+            self._server.server_close()
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=5)
+                if self._thread.is_alive():
+                    self.logger.warning("Health check server thread failed to stop")
+        except Exception as e:
+            self.logger.error(f"Error stopping health check server: {e}")
+        finally:
+            self._server = None
+            self._thread = None
+
+    def _create_error_response(self, status: str, message: str) -> bytes:
+        """Create standardized error response."""
+        response = {
+            "status": status,
+            "error": message,
+            "timestamp_utc": self.config.now_utc().isoformat()
+        }
+        return json.dumps(response, indent=2).encode()
+
+    def _create_wsgi_app(self):
+        """Create WSGI application for health checks."""
+        def app(environ, start_response):
+            path = environ.get('PATH_INFO', '').rstrip('/')
+            
+            if path not in ['', '/health']:
+                start_response('404 Not Found', [('Content-Type', 'application/json')])
+                return [self._create_error_response("error", "Not Found")]
+
+            is_healthy = self.metrics_collector.stats.is_healthy(
+                self.config.failure_threshold
+            )
+            
+            status = '200 OK' if is_healthy else '503 Service Unavailable'
+            headers = [
+                ('Content-Type', 'application/json'),
+                ('Cache-Control', 'no-cache, no-store, must-revalidate')
+            ]
+            start_response(status, headers)
+
+            response = {
+                "service": {
+                    "status": "healthy" if is_healthy else "unhealthy",
+                    "up": True,
+                    "current_datetime_utc": self.config.now_utc().isoformat(),
+                    "service_start_datetime_utc": self.config._start_time.isoformat(),
+                    "last_metrics_collection_datetime_utc": 
+                        self.metrics_collector.stats.last_collection_datetime.isoformat(),
+                    "uptime_seconds": round(self.config.get_uptime_seconds(), 6),
+                    "process_id": os.getpid(),
+                    "running_as": {
+                        "user": self.config.exporter_user,
+                        "uid": os.getuid(),
+                        "gid": os.getgid()
+                    },
+                    "systemd_managed": self.config.running_under_systemd
+                },
+                "stats": {
+                    "collection": {
+                        "attempts": self.metrics_collector.stats.attempts,
+                        "successful": self.metrics_collector.stats.successful,
+                        "errors": self.metrics_collector.stats.errors,
+                        "consecutive_failures": self.metrics_collector.stats.consecutive_failures,
+                        "failure_threshold": self.config.failure_threshold,
+                        "timing": {
+                            "last_collection_seconds": round(
+                                self.metrics_collector.stats.last_collection_time, 3
+                            ),
+                            "average_collection_seconds": round(
+                                self.metrics_collector.stats.get_average_collection_time(), 3
+                            )
+                        }
+                    },
+                    "configuration": {
+                        "poll_interval_seconds": self.config.poll_interval,
+                        "max_workers": self.config.max_workers,
+                        "collection_timeout_seconds": self.config.collection_timeout
+                    }
+                },
+                "files": {
+                    "script": {
+                        "name": self.config._source.base_name,
+                        "path": str(self.config._source.script_path.resolve()),
+                        "directory": str(self.config._source.script_dir)
+                    },
+                    "config": {
+                        "path": str(self.config._source.config_path),
+                        "last_modified_utc": datetime.fromtimestamp(
+                            self.config._source.config_path.stat().st_mtime, 
+                            tz=timezone.utc
+                        ).isoformat()
+                    },
+                    "log": {
+                        "path": str(self.config._source.log_path),
+                        "level": self.config.logging.get('level', 'DEBUG'),
+                        "file_level": self.config.logging.get('file_level', 'DEBUG'),
+                        "console_level": self.config.logging.get('console_level', 'INFO'),
+                        "journal_level": self.config.logging.get('journal_level', 'WARNING'),
+                        "max_size_bytes": self.config.logging.get('max_bytes', 10485760),
+                        "backup_count": self.config.logging.get('backup_count', 3)
+                    },
+                    "sudoers": {
+                        "path": str(self.config._source.sudoers_path),
+                        "file": self.config._source.sudoers_file
+                    }
+                }
+            }
+
+            # Add metrics inventory if requested
+            if environ.get('QUERY_STRING') == 'include_metrics=true':
+                response["metrics"] = self._get_metrics_inventory()
+            
+            return [json.dumps(response, indent=2).encode()]
+        
+        return app
+
+    def _get_metrics_inventory(self) -> Dict[str, Any]:
+        """Get metrics inventory with collection status."""
+        metrics_info = {}
+        last_collections = self.metrics_collector._last_collection_times
+        
+        for service_name, service_config in self.config.services.items():
+            service_info = {
+                "description": service_config.get("description", ""),
+                "run_as": service_config.get("run_as"),
+                "metric_groups": {}
+            }
+            
+            for group_name, group_config in service_config.get("metric_groups", {}).items():
+                group_info = {
+                    "command": group_config.get("command", ""),
+                    "metrics": {}
+                }
+                
+                for metric_name, metric_config in group_config.get("metrics", {}).items():
+                    metric_type = MetricType.from_config(metric_config)
+                    identifier = MetricIdentifier(
+                        service=service_name,
+                        group=group_name,
+                        name=metric_name,
+                        type=metric_type,
+                        description=metric_config.get("description", "")
+                    )
+                    
+                    last_collection = last_collections.get(identifier)
+                    metric_info = {
+                        "type": metric_type.value,
+                        "description": metric_config.get("description", ""),
+                        "prometheus_name": identifier.prometheus_name,
+                        "last_collection_utc": (
+                            last_collection.isoformat() if last_collection else None
+                        ),
+                        "settings": {
+                            "content_type": metric_config.get("content_type", "text"),
+                            "filter": metric_config.get("filter"),
+                            "value_on_error": metric_config.get("value_on_error")
+                        }
+                    }
+                    
+                    if metric_type == MetricType.STATIC:
+                        metric_info["settings"]["value"] = metric_config.get("value")
+                    
+                    group_info["metrics"][metric_name] = metric_info
+                
+                service_info["metric_groups"][group_name] = group_info
+            
+            metrics_info[service_name] = service_info
+        
+        return metrics_info
+
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Main Service Class and Entry Point
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
 class MetricsExporter:
-    """Main service class for Prometheus metrics exporter."""
+    """Main service class for Prometheus metrics exporter.
+    
+    This class manages the lifecycle of the metrics collection service,
+    including server startup/shutdown, metric collection, and health checks.
+    
+    Attributes:
+        source (ProgramSource): Program source information
+        config (ProgramConfig): Program configuration
+        logger (logging.Logger): Configured logger instance
+        shutdown_event (threading.Event): Event for coordinating shutdown
+        _servers_started (bool): Track if servers are running
+        user_manager (Optional[ServiceUserManager]): User permission manager
+        metrics_collector (MetricsCollector): Metrics collection manager
+        health_check (HealthCheck): Health check endpoint handler
+    
+    Raises:
+        RuntimeError: If required users are missing or sudo setup fails
+        OSError: If required ports are unavailable
+        Exception: For other initialization failures
+    """
     
     def __init__(
         self,
@@ -1306,6 +1646,7 @@ class MetricsExporter:
         self.config = config
         self.logger = logger
         self.shutdown_event = threading.Event()
+        self._servers_started = False
         
         self.logger.info("Starting metrics exporter initialization")
         
@@ -1332,32 +1673,100 @@ class MetricsExporter:
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
         
+        # Initialize health check endpoint
+        self.health_check = HealthCheck(self.config, self.metrics_collector, self.logger)
+
         self.logger.info("Metrics exporter initialized")
 
     def _handle_signal(self, signum, frame):
         """Handle shutdown signals."""
         signal_name = signal.Signals(signum).name
         self.logger.info(f"Received {signal_name}, initiating shutdown...")
-        if self.config.running_under_systemd:
-            notify(Notification.STOPPING)
-        self.shutdown_event.set()
+        try:
+            # Ensure cleanup happens before notification
+            self._cleanup()
+            if self.config.running_under_systemd:
+                notify(Notification.STOPPING)
+        except Exception as e:
+            self.logger.error(f"Error during signal cleanup: {e}")
+        finally:
+            self.shutdown_event.set()
 
     def check_ports(self) -> bool:
         """Check if required ports are available."""
-        ports = [
-            self.config.metrics_port,
-            self.config.health_port
+        port_configs = [
+            (self.config.metrics_port, "metrics"),
+            (self.config.health_port, "health check")
         ]
         
-        for port in ports:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                sock.bind(('', port))
-                sock.close()
-            except OSError:
-                self.logger.error(f"Port {port} is already in use")
+        for port, name in port_configs:
+            if not self._check_port_available(port, name):
                 return False
         return True
+
+    def _check_port_available(self, port: int, name: str) -> bool:
+        """Check if a specific port is available."""
+        if port < 1 or port > 65535:
+            self.logger.error(f"Invalid {name} port {port}: must be between 1-65535")
+            return False
+        
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(('', port))
+            sock.close()
+            return True
+        except OSError as e:
+            self.logger.error(f"{name.title()} port {port} is not available: {e}")
+            return False
+
+    def _start_servers(self) -> bool:
+        """Start metrics and health check servers."""
+        try:
+            # Always start metrics server first
+            try:
+                start_http_server(self.config.metrics_port)
+                self.logger.info(f"Started metrics server on port {self.config.metrics_port}")
+            except Exception as e:
+                self.logger.error(f"Failed to start metrics server: {e}")
+                return False
+
+            # Only start health check if metrics succeeded
+            try:
+                if not self.health_check.start():
+                    self.logger.error("Failed to start health check server")
+                    self.logger.info("Stopping metrics server (via process termination)")
+                    return False
+                self.logger.info(f"Started health check server on port {self.config.health_port}")
+            except Exception as e:
+                self.logger.error(f"Failed to start health check server: {e}")
+                self.logger.info("Stopping metrics server (via process termination)")
+                return False
+
+            self._servers_started = True
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Unexpected error starting servers: {e}")
+            return False
+
+    def _cleanup(self):
+        """Clean up resources on shutdown."""
+        if not self._servers_started:
+            return
+        
+        try:
+            # Stop servers in reverse order of startup
+            if self.health_check:
+                self.health_check.stop()
+                self.logger.info("Health check server stopped")
+
+            # Stop metrics server (no direct way with prometheus_client)
+            self.logger.info("Metrics server will stop with process termination")
+
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}")
+        finally:
+            self._servers_started = False
 
     async def run(self):
         """Main service loop."""
@@ -1369,16 +1778,12 @@ class MetricsExporter:
                     notify(Notification.STOPPING)
                 return 1
 
-            # Start Prometheus metrics server
-            try:
-                start_http_server(self.config.metrics_port)
-                self.logger.info(f"Started Prometheus metrics server on port {self.config.metrics_port}")
-            except Exception as e:
-                self.logger.error(f"Failed to start metrics server: {e}")
+            # Start servers
+            if not self._start_servers():
                 if self.config.running_under_systemd:
                     notify(Notification.STOPPING)
                 return 1
-            
+
             # Notify systemd we're ready
             if self.config.running_under_systemd:
                 notify(Notification.READY)
@@ -1393,7 +1798,15 @@ class MetricsExporter:
                     sleep_time = max(0, self.config.poll_interval - elapsed)
                     
                     if sleep_time > 0:
-                        await asyncio.sleep(sleep_time)
+                        # Use wait_for to handle shutdown during sleep
+                        try:
+                            await asyncio.wait_for(
+                                self.shutdown_event.wait(),
+                                timeout=sleep_time
+                            )
+                            break  # Exit loop if shutdown event is set
+                        except asyncio.TimeoutError:
+                            pass  # Normal timeout, continue collection
                     else:
                         self.logger.warning(
                             f"Collection took longer than poll interval "
@@ -1410,17 +1823,23 @@ class MetricsExporter:
             
         except Exception as e:
             self.logger.exception(f"Fatal error in service: {e}")
-            if self.config.running_under_systemd:
-                notify(Notification.STOPPING)
             return 1
-            
+
         finally:
+            # Ensure cleanup and notification happen
+            try:
+                self._cleanup()
+                if self.config.running_under_systemd:
+                    notify(Notification.STOPPING)
+            except Exception as e:
+                self.logger.error(f"Error during shutdown cleanup: {e}")
             self.logger.info("Service shutdown complete")
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
 async def main():
     """Entry point for the metrics exporter service."""
+    exporter = None
     try:
         source = ProgramSource()
         config = ProgramConfig(source)
@@ -1429,16 +1848,30 @@ async def main():
         try:
             exporter = MetricsExporter(source, config, logger)
             return await exporter.run()
+        
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt, shutting down...")
+            if exporter:
+                # Call cleanup method before exiting
+                exporter._cleanup()
+                # If running under systemd, notify stopping
+                if exporter.config.running_under_systemd:
+                    notify(Notification.STOPPING)
             return 0
+        
         except Exception as e:
             logger.error(f"Failed to start metrics exporter: {e}")
+            if exporter:
+                exporter._cleanup()
+                if exporter.config.running_under_systemd:
+                    notify(Notification.STOPPING)
             return 1
 
     except Exception as e:
         # Only use print for catastrophic failures in logger setup
         print(f"Fatal error during startup: {e}", file=sys.stderr)
+        if exporter:
+            exporter._cleanup()
         return 1
 
 if __name__ == '__main__':
