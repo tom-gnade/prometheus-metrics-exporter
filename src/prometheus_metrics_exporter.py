@@ -1462,105 +1462,118 @@ class ServiceMetricsCollector:
             except Exception as e:
                 self.logger.error(f"Failed to initialize user context for {service_name}: {e}")
     
-    async def collect_metrics(self) -> Dict[MetricIdentifier, float]:
+async def collect_metrics(self) -> Dict[MetricIdentifier, float]:
         """Collect all metrics for this service."""
         results = {}
-        self.logger.debug(f"Starting metrics collection for service: {self.service_name}")
-        self.logger.debug(f"Service config: {self.service_config}")
+        self.logger.info(f"Starting metrics collection for service: {self.service_name}")
+        self.logger.info(f"Service config: {self.service_config}")
         
         for group_name, group_config in self.service_config.get('metric_groups', {}).items():
+            self.logger.info(f"Processing metric group: {group_name}")
+            self.logger.info(f"Group config: {group_config}")
+            
             group_type = MetricGroupType.from_config(group_config)
-            self.logger.debug(f"Processing metric group: {group_name} (type: {group_type.value})")
-            self.logger.debug(f"Group config: {group_config}")
-            
-            if group_type == MetricGroupType.STATIC:
-                self.logger.debug(f"Processing static metric group: {group_name}")
-                # Process static metrics directly from config
-                for metric_name, metric_config in group_config.get('metrics', {}).items():
-                    try:
-                        identifier = MetricIdentifier(
-                            service=self.service_name,
-                            group=group_name,
-                            name=metric_name,
-                            group_type=MetricGroupType.STATIC,
-                            description=metric_config['description']
-                        )
-                        results[identifier] = float(metric_config['value'])
-                        self.logger.debug(f"Added static metric: {identifier.prometheus_name} = {metric_config['value']}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to process static metric {metric_name}: {e}")
-            
-            else:  # DYNAMIC
-                self.logger.debug(f"Processing dynamic metric group: {group_name}")
-                try:
-                    self.logger.debug(f"Collecting dynamic metrics for group: {group_name}")
-                    group_metrics = await self.collect_group(group_name, group_config)
-                    results.update(group_metrics)
-                except Exception as e:
-                    self.logger.error(f"Failed to collect dynamic metric group {group_name}: {e}")
-        
-        self.logger.debug(f"Service {self.service_name} final collection results: {results}")
-        return results
-    
-    async def collect_group(
-            self,
-            group_name: str,
-            group_config: Dict
-        ) -> Dict[MetricIdentifier, float]:
-            """Collect metrics for a dynamic group."""
-            self.logger.debug(f"Starting collection for dynamic group {group_name}")
-            results = {}
+            self.logger.info(f"Group type determined as: {group_type}")
             
             try:
-                # Execute command for dynamic metrics
-                command = group_config['command']
-                result = await self.command_executor.execute_command(command, self.user_context)
-                
-                if not result.success:
-                    self.logger.error(f"Command failed for group {group_name}: {result.error_message}")
-                    # Handle error values if specified
+                if group_type == MetricGroupType.STATIC:
+                    self.logger.info(f"Processing static metric group: {group_name}")
+                    # Process static metrics
                     for metric_name, metric_config in group_config.get('metrics', {}).items():
-                        if 'value_on_error' in metric_config:
+                        try:
                             identifier = MetricIdentifier(
                                 service=self.service_name,
                                 group=group_name,
                                 name=metric_name,
-                                group_type=MetricGroupType.DYNAMIC,
-                                type=MetricType.from_config(metric_config),
+                                group_type=MetricGroupType.STATIC,
                                 description=metric_config['description']
                             )
-                            results[identifier] = float(metric_config['value_on_error'])
-                    return results
-
-                # Parse metrics from command output
-                for metric_name, metric_config in group_config.get('metrics', {}).items():
+                            results[identifier] = float(metric_config['value'])
+                            self.logger.info(f"Added static metric: {identifier.prometheus_name} = {metric_config['value']}")
+                        except Exception as e:
+                            self.logger.error(f"Failed to process static metric {metric_name}: {e}")
+                else:
+                    self.logger.info(f"Processing dynamic metric group: {group_name}")
                     try:
-                        metric_type = MetricType.from_config(metric_config)  # Get the type once
+                        group_metrics = await self.collect_group(group_name, group_config)
+                        self.logger.info(f"Group {group_name} collection results: {group_metrics}")
+                        results.update(group_metrics)
+                    except Exception as e:
+                        self.logger.error(f"Failed to collect dynamic metric group {group_name}: {e}", exc_info=True)
+            except Exception as e:
+                self.logger.error(f"Failed to process group {group_name}: {e}", exc_info=True)
+        
+        self.logger.info(f"Service {self.service_name} final collection results: {results}")
+        return results
+    
+    async def collect_group(
+        self,
+        group_name: str,
+        group_config: Dict
+    ) -> Dict[MetricIdentifier, float]:
+        """Collect metrics for a dynamic group."""
+        self.logger.info(f"Starting collection for dynamic group {group_name}")
+        self.logger.info(f"Group config: {group_config}")
+        results = {}
+        
+        try:
+            # Execute command for dynamic metrics
+            command = group_config['command']
+            self.logger.info(f"Executing command: {command}")
+            result = await self.command_executor.execute_command(command, self.user_context)
+            self.logger.info(f"Command execution result: {result}")
+            
+            if not result.success:
+                self.logger.error(f"Command failed for group {group_name}: {result.error_message}")
+                # Handle error values if specified
+                for metric_name, metric_config in group_config.get('metrics', {}).items():
+                    if 'value_on_error' in metric_config:
                         identifier = MetricIdentifier(
                             service=self.service_name,
                             group=group_name,
                             name=metric_name,
                             group_type=MetricGroupType.DYNAMIC,
-                            type=metric_type,
+                            type=MetricType.from_config(metric_config),
                             description=metric_config['description']
                         )
-                        
-                        value = self._parse_metric_value(result.output, metric_config, metric_type)
-                        if value is not None:
-                            results[identifier] = value
-                            self.logger.debug(f"Collected dynamic metric {metric_name} = {value}")
-                        elif 'value_on_error' in metric_config:
-                            results[identifier] = float(metric_config['value_on_error'])
-                            self.logger.debug(f"Using error value for {metric_name} = {metric_config['value_on_error']}")
-                            
-                    except Exception as e:
-                        self.logger.error(f"Failed to collect dynamic metric {metric_name}: {e}")
-                
+                        results[identifier] = float(metric_config['value_on_error'])
+                        self.logger.info(f"Using error value for {metric_name}: {metric_config['value_on_error']}")
                 return results
+
+            # Parse metrics from command output
+            for metric_name, metric_config in group_config.get('metrics', {}).items():
+                try:
+                    self.logger.info(f"Processing metric {metric_name}")
+                    self.logger.info(f"Metric config: {metric_config}")
+                    
+                    metric_type = MetricType.from_config(metric_config)
+                    identifier = MetricIdentifier(
+                        service=self.service_name,
+                        group=group_name,
+                        name=metric_name,
+                        group_type=MetricGroupType.DYNAMIC,
+                        type=metric_type,
+                        description=metric_config['description']
+                    )
+                    
+                    value = self._parse_metric_value(result.output, metric_config, metric_type)
+                    self.logger.info(f"Parsed value for {metric_name}: {value}")
+                    
+                    if value is not None:
+                        results[identifier] = value
+                        self.logger.info(f"Collected dynamic metric {metric_name} = {value}")
+                    elif 'value_on_error' in metric_config:
+                        results[identifier] = float(metric_config['value_on_error'])
+                        self.logger.info(f"Using error value for {metric_name} = {metric_config['value_on_error']}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Failed to collect dynamic metric {metric_name}: {e}", exc_info=True)
+            
+            return results
                 
-            except Exception as e:
-                self.logger.error(f"Failed to collect group {group_name}: {e}")
-                return {}
+        except Exception as e:
+            self.logger.error(f"Failed to collect group {group_name}: {e}", exc_info=True)
+            return {}
     
     def _parse_metric_value(
             self,
