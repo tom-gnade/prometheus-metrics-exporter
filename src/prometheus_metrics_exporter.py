@@ -481,14 +481,19 @@ class ProgramConfig:
             if not isinstance(group_config, dict):
                 raise MetricConfigurationError("Must be a dictionary")
 
-            validated = {}
+            self.logger.debug(f"Validating metric group {group_name} in service {service_name}")
+            self.logger.debug(f"Group config: {group_config}")
             
-            # Validate metrics first to determine if command is required
+            validated = {}
             validated['metrics'] = {}
             static_metrics_only = True
             
-            for metric_name, metric_config in group_config.get('metrics', {}).items():
+            metrics = group_config.get('metrics', {})
+            self.logger.debug(f"Found {len(metrics)} metrics in group: {list(metrics.keys())}")
+            
+            for metric_name, metric_config in metrics.items():
                 try:
+                    self.logger.debug(f"Validating metric {metric_name}: {metric_config}")
                     validated_metric = self._validate_metric(
                         service_name,
                         group_name,
@@ -496,33 +501,33 @@ class ProgramConfig:
                         metric_config
                     )
                     if validated_metric:
+                        self.logger.debug(f"Validated metric {metric_name}: {validated_metric}")
                         if validated_metric.get('type') != 'static':
                             static_metrics_only = False
                         validated['metrics'][metric_name] = validated_metric
                         self._validation_stats['metrics']['valid'] += 1
                     else:
+                        self.logger.debug(f"Metric {metric_name} validation returned None")
                         self._validation_stats['metrics']['invalid'] += 1
                 except Exception as e:
                     self._validation_stats['metrics']['invalid'] += 1
-                    if self.logger:
-                        self.logger.warning(
-                            f"Failed to validate metric '{metric_name}': {e}"
-                        )
+                    self.logger.error(f"Failed to validate metric '{metric_name}': {e}", exc_info=True)
+
+            self.logger.debug(f"Validated metrics for group {group_name}: {validated['metrics']}")
 
             if not validated['metrics']:
                 raise MetricConfigurationError("No valid metrics defined")
-                
-            # Changed this condition - command is optional if we have static metrics
+
             if 'command' in group_config:
                 validated['command'] = group_config['command']
             elif not static_metrics_only:
                 raise MetricConfigurationError("Command required when group has non-static metrics")
 
-            # Copy group properties
             for field in ['content_type', 'collection_frequency']:
                 if field in group_config:
                     validated[field] = group_config[field]
 
+            self.logger.debug(f"Final validated group config: {validated}")
             return validated
 
     def _validate_metric(
@@ -533,6 +538,8 @@ class ProgramConfig:
             metric_config: Dict[str, Any]
         ) -> Optional[Dict[str, Any]]:
             """Validate individual metric configuration."""
+            self.logger.debug(f"Starting validation of metric {metric_name}")
+            
             if not isinstance(metric_config, dict):
                 raise MetricConfigurationError("Must be a dictionary")
 
@@ -541,6 +548,9 @@ class ProgramConfig:
             # Validate required fields
             if 'type' not in metric_config:
                 raise MetricConfigurationError("Missing required field: type")
+            
+            metric_type = MetricType.from_config(metric_config)
+            self.logger.debug(f"Metric {metric_name} type: {metric_type}")
                 
             if 'description' not in metric_config:
                 raise MetricConfigurationError("Missing required field: description")
@@ -548,15 +558,15 @@ class ProgramConfig:
             validated['type'] = metric_config['type']
             validated['description'] = metric_config['description']
 
-            # Type-specific validation
             try:
-                metric_type = MetricType.from_config(metric_config)
-                
                 if metric_type == MetricType.STATIC:
+                    self.logger.debug(f"Validating static metric {metric_name}")
                     if 'value' not in metric_config:
                         raise MetricConfigurationError("Static metric must specify a value")
                     validated['value'] = float(metric_config['value'])
+                    self.logger.debug(f"Static metric {metric_name} value: {validated['value']}")
                 else:  # gauge or counter
+                    self.logger.debug(f"Validating non-static metric {metric_name}")
                     if 'filter' not in metric_config:
                         raise MetricConfigurationError(
                             f"{metric_type.value} metric must specify a filter"
@@ -568,9 +578,11 @@ class ProgramConfig:
                     if field in metric_config:
                         validated[field] = metric_config[field]
 
+                self.logger.debug(f"Successfully validated metric {metric_name}: {validated}")
                 return validated
 
             except Exception as e:
+                self.logger.error(f"Error validating metric {metric_name}: {e}", exc_info=True)
                 raise MetricConfigurationError(f"Invalid metric configuration: {e}")
 
     def _log_validation_summary(self, initial_load: bool) -> None:
