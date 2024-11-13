@@ -163,43 +163,32 @@ class VerboseLogger(logging.Logger):
     # Class-level config - keep False by default, only enable during development
     VERBOSE_DEBUG = False
 
+    # Create a custom VERBOSE level below DEBUG
+    VERBOSE = 5  # VERBOSE is 5, DEBUG is 10, INFO is 20
+    logging.addLevelName(VERBOSE, 'VERBOSE')
+
     def verbose(
         self,
         msg: Union[str, Callable[[], str]],
         *args: Any,
         **kwargs: Any
     ) -> None:
-        """Log verbose debug messages with efficient deferred evaluation.
-        
-        When VERBOSE_DEBUG = False, returns immediately with no processing overhead.
-        When enabled, supports both direct messages and deferred expensive computations.
-
-        Args:
-            msg: Message to log or callable that produces the message
-            *args: Format string arguments
-            **kwargs: Format string keyword arguments
-
-        Example:
-            logger.verbose("Simple message")  # Direct string
-            logger.verbose("Count: {}", count)  # Format args
-            logger.verbose("User: {name}", name=user)  # Format kwargs
-            logger.verbose(lambda: f"Active: {[u for u in users if u.active]}")  # Deferred
-        """
+        """Log verbose debug messages with efficient deferred evaluation."""
         if not self.VERBOSE_DEBUG:
             return
 
         # Handle deferred evaluation of expensive computations
         if callable(msg):
             if args or kwargs:
-                super().debug(msg(*args, **kwargs))
+                self.log(self.VERBOSE, msg(*args, **kwargs))
             else:
-                super().debug(msg())
+                self.log(self.VERBOSE, msg())
         # Handle string formatting
         elif args or kwargs:
-            super().debug(msg.format(*args, **kwargs))
+            self.log(self.VERBOSE, msg.format(*args, **kwargs))
         # Handle simple strings
         else:
-            super().debug(msg)
+            self.log(self.VERBOSE, msg)
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Core Exceptions
