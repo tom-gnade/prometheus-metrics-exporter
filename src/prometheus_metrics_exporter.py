@@ -1731,13 +1731,12 @@ class MetricsCollector:
             self.logger = logger
             self.stats = CollectionStats()
             self.service_collectors: Dict[str, ServiceMetricsCollector] = {}
-            self._prometheus_metrics: Dict[MetricIdentifier, Union[Gauge, Counter]] = {}
-            self._previous_values: Dict[MetricIdentifier, float] = {}
+            self._prometheus_metrics: Dict[str, Union[Gauge, Counter]] = {}
+            self._previous_values: Dict[str, float] = {}
             self.collection_manager = CollectionManager(config, logger)
             
             # Register for config reload notifications
             self.config.register_reload_callback(self._reinitialize_collectors)
-            
             self._initialize_collectors()
             self._setup_internal_metrics()
     
@@ -1814,13 +1813,14 @@ class MetricsCollector:
                 labelnames=label_names
             )
 
-    def _get_metric_key(self, identifier: MetricIdentifier, labels: Dict[str, str]) -> str:
-        """Create unique key for tracking counter values."""
-        if not labels:
-            return identifier
-        # Sort labels for consistent keys
-        label_items = sorted(labels.items())
-        return (identifier, tuple(label_items))
+    def _get_metric_key(self, identifier: MetricIdentifier, labels: Optional[Dict[str, str]] = None) -> str:
+        """Create unique metric key."""
+        key = f"{identifier.service}_{identifier.group}_{identifier.name}"
+        if labels:
+            # Sort labels for consistent key generation 
+            label_str = '_'.join(f"{k}={v}" for k, v in sorted(labels.items()))
+            key = f"{key}_{label_str}"
+        return key
 
     def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
         """Update Prometheus metrics with collected values."""
@@ -1833,33 +1833,36 @@ class MetricsCollector:
         self.logger.info(f"Updating Prometheus metrics with {len(metrics)} metrics")
         for identifier, value in sorted_metrics:
             try:
-                metric_name = identifier.prometheus_name
-                self.logger.verbose(f"Processing metric: {metric_name} = {value}")
-                
-                # Create metric if it doesn't exist
-                if identifier not in self._prometheus_metrics:
-                    self.logger.info(f"Creating new Prometheus metric: {metric_name}")
-                    metric = self._create_prometheus_metric(identifier)
-                    self._prometheus_metrics[identifier] = metric
-                
-                if value is not None:
-                    metric = self._prometheus_metrics[identifier]
 
-                    # Get the metric with labels if they exist
+                metric_key = self._get_metric_key(identifier)
+
+               # Create metric if it doesn't exist
+                if metric_key not in self._prometheus_metrics:
+                    self.logger.info(f"Creating new Prometheus metric: {metric_key}")
+                    metric = self._create_prometheus_metric(identifier)
+                    self._prometheus_metrics[metric_key] = metric
+
+                if value is not None:
+                    metric = self._prometheus_metrics[metric_key]
+
+                   # Get label values if any
+                    label_values = None 
                     if identifier.labels:
                         label_values = {label.name: label.value for label in identifier.labels}
                         metric = metric.labels(**label_values)
-                    
+
+                   # Use full key with labels for counter values
+                    full_key = self._get_metric_key(identifier, label_values)
+
                     if isinstance(metric, Counter):
-                        metric_key = self._get_metric_key(identifier, label_values)
-                        prev_value = self._previous_values.get(metric_key, 0)
+                        prev_value = self._previous_values.get(full_key, 0)
                         if value > prev_value:
                             metric.inc(value - prev_value)
-                        self._previous_values[metric_key] = value
-                        self.logger.info(f"Updated counter {metric_name} to {value}")
+                        self._previous_values[full_key] = value
+                        self.logger.info(f"Updated counter {metric_key} to {value}")
                     else:  # Gauge
                         metric.set(value)
-                        self.logger.info(f"Set gauge {metric_name} to {value}")
+                        self.logger.info(f"Set gauge {metric_key} to {value}")
                         
             except Exception as e:
                 self.logger.error(f"Failed to update metric {identifier.prometheus_name}: {e}")
