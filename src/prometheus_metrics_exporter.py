@@ -281,10 +281,12 @@ class ProgramConfig:
         """Initialize configuration manager."""
         self._source = source
         self._config: Dict[str, Any] = {}
+        self._initial_exporter: Dict[str, Any] = {}
         self._last_load_time: float = 0
         self._lock: threading.Lock = threading.Lock()
         self._running_under_systemd: bool = bool(os.getenv('INVOCATION_ID'))
         self._start_time: datetime = self.now_utc()
+        self.logger = None
         
         # Track validation status
         self._validation_stats = {
@@ -299,7 +301,10 @@ class ProgramConfig:
         
         # Set up initial logging config
         self._config = self._merge_defaults(base_config)
-        self.logger = ProgramLogger(source, self).logger
+
+        # Now we can create the logger
+        logger_instance = ProgramLogger(source, self)
+        self.logger = logger_instance.logger
         
         # Store initial exporter config
         self._initial_exporter = deepcopy(self._config.get('exporter', {}))
@@ -861,24 +866,30 @@ class ProgramLogger:
         logger = logging.getLogger(self.source.logger_name)
         logger.handlers.clear()
 
-        log_level = self.config.logging['level']
+        # Access raw config dictionary instead of using properties
+        log_settings = self.config._config['exporter']['logging']
+
+        log_level = log_settings['level']
         logger.setLevel(log_level)
-        formatter = self._get_formatter()
+        formatter = logging.Formatter(
+            log_settings['format'],
+            log_settings['date_format']
+        )
         
         # File handler
         file_handler = RotatingFileHandler(
             self.source.log_path,
-            maxBytes=self.config.logging['max_bytes'],
-            backupCount=self.config.logging['backup_count']
+            maxBytes=log_settings['max_bytes'],
+            backupCount=log_settings['backup_count']
         )
-        file_handler.setLevel(self.config.logging['file_level'])
+        file_handler.setLevel(log_settings['file_level'])
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         self._handlers['file'] = file_handler
         
         # Console handler
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(self.config.logging['console_level'])
+        console_handler.setLevel(log_settings['console_level'])
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
         self._handlers['console'] = console_handler
@@ -886,7 +897,7 @@ class ProgramLogger:
         # Journal handler for systemd
         if self.config.running_under_systemd:
             journal_handler = journal.JournaldLogHandler()
-            journal_handler.setLevel(self.config.logging['journal_level'])
+            journal_handler.setLevel(log_settings['journal_level'])
             journal_handler.setFormatter(formatter)
             logger.addHandler(journal_handler)
             self._handlers['journal'] = journal_handler
