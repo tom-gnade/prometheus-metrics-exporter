@@ -2245,6 +2245,11 @@ class MetricsExporter:
     async def run(self):
         """Main service loop."""
         try:
+
+            # Create a simple test metric
+            test_metric = Gauge('test_metric', 'Test metric to verify Prometheus registration')
+            test_metric.set(42.0)
+
             # Check ports before starting
             if not self.check_ports():
                 self.logger.error("Required ports are not available")
