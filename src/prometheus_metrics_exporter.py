@@ -1630,16 +1630,15 @@ class MetricsCollector:
         self.logger = logger
         self.stats = CollectionStats()
         self.service_collectors: Dict[str, ServiceMetricsCollector] = {}
+        # Split into two dictionaries - one for main metrics, one for timestamps
         self._prometheus_metrics: Dict[MetricIdentifier, Union[Gauge, Counter]] = {}
+        self._timestamp_metrics: Dict[str, Gauge] = {}
         self._previous_values: Dict[MetricIdentifier, float] = {}
         self._last_collection_times: Dict[MetricIdentifier, datetime] = {}
         self.collection_manager = CollectionManager(config, logger)
         
-        # Add initialization debug logging
-        self.logger.debug("Initializing MetricsCollector")
         self._initialize_collectors()
         self._setup_internal_metrics()
-        self.logger.debug(f"Initialized {len(self.service_collectors)} service collectors")
     
     def _initialize_collectors(self):
         """Initialize collectors for each service."""
@@ -1655,7 +1654,7 @@ class MetricsCollector:
                 self.logger.error(
                     f"Failed to initialize collector for {service_name}: {e}"
                 )
-    
+
     def _setup_internal_metrics(self):
         """Set up internal metrics tracking."""
         self._internal_metrics = {
@@ -1681,6 +1680,82 @@ class MetricsCollector:
             )
         }
 
+    def _create_prometheus_metric(
+        self,
+        identifier: MetricIdentifier
+    ) -> Union[Gauge, Counter]:
+        """Create appropriate Prometheus metric based on identifier."""
+        if identifier.group_type == MetricGroupType.STATIC:
+            return Gauge(
+                identifier.prometheus_name,
+                identifier.description
+            )
+        elif identifier.type == MetricType.COUNTER:
+            return Counter(
+                identifier.prometheus_name,
+                identifier.description
+            )
+        else:
+            return Gauge(
+                identifier.prometheus_name,
+                identifier.description
+            )
+
+    def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
+        """Update Prometheus metrics with collected values."""
+        collection_time = round(self.config.now_utc().timestamp(), 3)
+        
+        self.logger.info(f"Updating Prometheus metrics with {len(metrics)} metrics")
+        for identifier, value in metrics.items():
+            try:
+                metric_name = identifier.prometheus_name
+                self.logger.debug(f"Processing metric: {metric_name} = {value}")
+                
+                # Create metric if it doesn't exist
+                if identifier not in self._prometheus_metrics:
+                    self.logger.info(f"Creating new Prometheus metric: {metric_name}")
+                    metric = self._create_prometheus_metric(identifier)
+                    self._prometheus_metrics[identifier] = metric
+                    
+                    # Create timestamp metric in separate dictionary
+                    timestamp_name = f"{metric_name}_last_collected_unix_seconds"
+                    self._timestamp_metrics[timestamp_name] = Gauge(
+                        timestamp_name,
+                        f"Unix timestamp when {metric_name} was last collected"
+                    )
+                
+                if value is not None:
+                    metric = self._prometheus_metrics[identifier]
+                    self._last_collection_times[identifier] = self.config.now_utc()
+                    
+                    # Update the metric value
+                    if isinstance(metric, Counter):
+                        prev_value = self._previous_values.get(identifier, 0)
+                        if value > prev_value:
+                            metric.inc(value - prev_value)
+                        self._previous_values[identifier] = value
+                        self.logger.info(f"Updated counter {metric_name} to {value}")
+                    else:  # Gauge
+                        metric.set(value)
+                        self.logger.info(f"Set gauge {metric_name} to {value}")
+
+                    # Update timestamp in separate dictionary
+                    timestamp_name = f"{metric_name}_last_collected_unix_seconds"
+                    self._timestamp_metrics[timestamp_name].set(collection_time)
+                        
+            except Exception as e:
+                self.logger.error(f"Failed to update metric {identifier.prometheus_name}: {e}")
+
+    def _update_internal_metrics(self, successes: int, errors: int, duration: float):
+        """Update internal metrics."""
+        collection_time = round(self.config.now_utc().timestamp(), 3)
+
+        self._internal_metrics['collection_successful'].set(self.stats.successful)
+        self._internal_metrics['collection_errors'].set(self.stats.errors)
+        self._internal_metrics['collection_duration'].set(duration)
+        self._internal_metrics['uptime'].set(self.config.get_uptime_seconds())
+        self._internal_metrics['last_collection_unix_seconds'].set(collection_time)
+
     async def collect_all_metrics(self) -> bool:
         """Collect metrics from all services with parallel execution."""
         collection_start = self.config.now_utc().timestamp()
@@ -1700,9 +1775,6 @@ class MetricsCollector:
                 self.service_collectors
             )
             
-            # Debug log the raw results
-            self.logger.debug(f"Raw collection results: {service_results}")
-            
             # Process results from each service
             for service_name, metrics in service_results.items():
                 self.logger.debug(f"Processing results for service {service_name}: {metrics}")
@@ -1715,13 +1787,8 @@ class MetricsCollector:
                     errors += 1
             
             # Debug log final metrics state
-            metric_names = []
-            for identifier, metric in self._prometheus_metrics.items():
-                try:
-                    metric_names.append(identifier.prometheus_name)
-                except Exception as e:
-                    self.logger.error(f"Error getting metric info: {e}")
-            self.logger.debug(f"Current Prometheus metrics: {metric_names}")
+            self.logger.debug(f"Current metrics count: {len(self._prometheus_metrics)}")
+            self.logger.debug(f"Current timestamp metrics count: {len(self._timestamp_metrics)}")
             
             # Update statistics
             collection_time = self.config.now_utc().timestamp() - collection_start
@@ -1754,79 +1821,6 @@ class MetricsCollector:
         except Exception as e:
             self.logger.error(f"Failed to collect metrics: {e}", exc_info=True)
             return False
-    
-    def _create_prometheus_metric(
-        self,
-        identifier: MetricIdentifier
-    ) -> Union[Gauge, Counter]:
-        """Create appropriate Prometheus metric based on identifier."""
-        metric_name = f"{identifier.service}_{identifier.group}_{identifier.name}"
-        
-        if identifier.group_type == MetricGroupType.STATIC:
-            self.logger.info(f"Creating static gauge metric: {metric_name}")
-            return Gauge(metric_name, identifier.description)
-        elif identifier.type == MetricType.COUNTER:
-            self.logger.info(f"Creating counter metric: {metric_name}")
-            return Counter(metric_name, identifier.description)
-        else:
-            self.logger.info(f"Creating gauge metric: {metric_name}")
-            return Gauge(metric_name, identifier.description)
-
-    def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
-        """Update Prometheus metrics with collected values."""
-        collection_time = round(self.config.now_utc().timestamp(), 3)
-        
-        self.logger.info(f"Updating Prometheus metrics with {len(metrics)} metrics")
-        for identifier, value in metrics.items():
-            try:
-                metric_name = identifier.prometheus_name
-                self.logger.debug(f"Processing metric: {metric_name} = {value}")
-                
-                # Create metric if it doesn't exist
-                if identifier not in self._prometheus_metrics:
-                    self.logger.info(f"Creating new Prometheus metric: {metric_name}")
-                    metric = self._create_prometheus_metric(identifier)
-                    self._prometheus_metrics[identifier] = metric
-                    
-                    # Also create timestamp metric
-                    timestamp_name = f"{metric_name}_last_collected_unix_seconds"
-                    self._prometheus_metrics[timestamp_name] = Gauge(
-                        timestamp_name,
-                        f"Unix timestamp when {metric_name} was last collected"
-                    )
-                
-                if value is not None:
-                    metric = self._prometheus_metrics[identifier]
-                    self._last_collection_times[identifier] = self.config.now_utc()
-                    
-                    # Update the metric value
-                    if isinstance(metric, Counter):
-                        prev_value = self._previous_values.get(identifier, 0)
-                        if value > prev_value:
-                            metric.inc(value - prev_value)
-                        self._previous_values[identifier] = value
-                        self.logger.info(f"Updated counter {metric_name} to {value}")
-                    else:  # Gauge
-                        metric.set(value)
-                        self.logger.info(f"Set gauge {metric_name} to {value}")
-
-                    # Update timestamp
-                    timestamp_name = f"{metric_name}_last_collected_unix_seconds"
-                    if timestamp_name in self._prometheus_metrics:
-                        self._prometheus_metrics[timestamp_name].set(collection_time)
-                        
-            except Exception as e:
-                self.logger.error(f"Failed to update metric {identifier.prometheus_name}: {e}")
-
-    def _update_internal_metrics(self, successes: int, errors: int, duration: float):
-        """Update internal metrics."""
-        collection_time = round(self.config.now_utc().timestamp(), 3)
-
-        self._internal_metrics['collection_successful'].set(self.stats.successful)
-        self._internal_metrics['collection_errors'].set(self.stats.errors)
-        self._internal_metrics['collection_duration'].set(duration)
-        self._internal_metrics['uptime'].set(self.config.get_uptime_seconds())
-        self._internal_metrics['last_collection_unix_seconds'].set(collection_time)
     
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Health Check Endpoint
