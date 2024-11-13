@@ -603,6 +603,26 @@ class ProgramConfig:
             validated['type'] = metric_config['type']
             validated['description'] = metric_config['description']
 
+            # Validate labels if present
+            if 'labels' in metric_config:
+                if not isinstance(metric_config['labels'], dict):
+                    raise MetricConfigurationError("Labels must be a dictionary")
+            
+            validated_labels = {}
+            for label_name, label_config in metric_config['labels'].items():
+                if not isinstance(label_config, dict):
+                    raise MetricConfigurationError(f"Label {label_name} configuration must be a dictionary")
+                
+                if 'filter' not in label_config:
+                    raise MetricConfigurationError(f"Label {label_name} must specify a filter")
+                
+                validated_labels[label_name] = {
+                    'filter': label_config['filter'],
+                    'content_type': label_config.get('content_type', 'text')
+                }
+            
+            validated['labels'] = validated_labels
+
             try:
                 if metric_type == MetricType.STATIC:
                     self.logger.verbose(f"Validating static metric {metric_name}")
@@ -1057,6 +1077,14 @@ class MetricType(Enum):
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
 @dataclass(frozen=True, eq=True)
+class MetricLabel:
+    """Label definition for metrics."""
+    name: str
+    value: Optional[str] = None
+    filter: Optional[str] = None
+    content_type: str = "text"
+
+@dataclass(frozen=True, eq=True)
 class MetricIdentifier:
     """Structured metric identifier."""
     service: str
@@ -1065,11 +1093,16 @@ class MetricIdentifier:
     group_type: MetricGroupType
     description: str
     type: Optional[MetricType] = None  # Optional because static metrics don't need a type
+    labels: List[MetricLabel] = field(default_factory=list)
 
     @property
     def prometheus_name(self) -> str:
         """Get prometheus-compatible metric name."""
         return f"{self.service}_{self.group}_{self.name}"
+
+    def get_label_dict(self) -> Dict[str, str]:
+        """Get labels as a dictionary for Prometheus."""
+        return {label.name: (label.value or '') for label in self.labels}
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -1584,13 +1617,20 @@ class ServiceMetricsCollector:
                     self.logger.info(f"Metric config: {metric_config}")
                     
                     metric_type = MetricType.from_config(metric_config)
+
+                    # Extract label values if present
+                    labels = []
+                    if 'labels' in metric_config:
+                        labels = self._extract_label_values(result.output, metric_config['labels'])
+
                     identifier = MetricIdentifier(
                         service=self.service_name,
                         group=group_name,
                         name=metric_name,
                         group_type=MetricGroupType.DYNAMIC,
                         type=metric_type,
-                        description=metric_config['description']
+                        description=metric_config['description'],
+                        labels=labels
                     )
                     
                     value = self._parse_metric_value(result.output, metric_config, metric_type)
@@ -1650,6 +1690,36 @@ class ServiceMetricsCollector:
                     f"Skipping this metric but continuing collection."
                 )
                 return None
+
+    def _extract_label_values(
+            self,
+            source_data: str,
+            label_configs: Dict[str, Dict[str, Any]]
+        ) -> List[MetricLabel]:
+            """Extract label values from command output."""
+            labels = []
+            for label_name, label_config in label_configs.items():
+                try:
+                    content_type = ContentType(label_config.get('content_type', 'text'))
+                    value = content_type.parse_value(
+                        source_data,
+                        label_config['filter'],
+                        self.logger
+                    )
+                    # Convert numeric value to string for label
+                    if value is not None:
+                        value = str(value)
+                    labels.append(MetricLabel(
+                        name=label_name,
+                        value=value,
+                        filter=label_config['filter'],
+                        content_type=label_config.get('content_type', 'text')
+                    ))
+                except Exception as e:
+                    self.logger.warning(f"Failed to extract label {label_name}: {e}")
+                    labels.append(MetricLabel(name=label_name))
+                    
+            return labels
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -1722,21 +1792,35 @@ class MetricsCollector:
         identifier: MetricIdentifier
     ) -> Union[Gauge, Counter]:
         """Create appropriate Prometheus metric based on identifier."""
+        # Get label names from identifier
+        label_names = [label.name for label in identifier.labels] if identifier.labels else []
+
         if identifier.group_type == MetricGroupType.STATIC:
             return Gauge(
                 identifier.prometheus_name,
-                identifier.description
+                identifier.description,
+                labelnames=label_names
             )
         elif identifier.type == MetricType.COUNTER:
             return Counter(
                 identifier.prometheus_name,
-                identifier.description
+                identifier.description,
+                labelnames=label_names
             )
         else:
             return Gauge(
                 identifier.prometheus_name,
-                identifier.description
+                identifier.description,
+                labelnames=label_names
             )
+
+    def _get_metric_key(self, identifier: MetricIdentifier, labels: Dict[str, str]) -> str:
+        """Create unique key for tracking counter values."""
+        if not labels:
+            return identifier
+        # Sort labels for consistent keys
+        label_items = sorted(labels.items())
+        return (identifier, tuple(label_items))
 
     def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
         """Update Prometheus metrics with collected values."""
@@ -1760,13 +1844,18 @@ class MetricsCollector:
                 
                 if value is not None:
                     metric = self._prometheus_metrics[identifier]
+
+                    # Get the metric with labels if they exist
+                    if identifier.labels:
+                        label_values = {label.name: label.value for label in identifier.labels}
+                        metric = metric.labels(**label_values)
                     
-                    # Update the metric value
                     if isinstance(metric, Counter):
-                        prev_value = self._previous_values.get(identifier, 0)
+                        metric_key = self._get_metric_key(identifier, label_values)
+                        prev_value = self._previous_values.get(metric_key, 0)
                         if value > prev_value:
                             metric.inc(value - prev_value)
-                        self._previous_values[identifier] = value
+                        self._previous_values[metric_key] = value
                         self.logger.info(f"Updated counter {metric_name} to {value}")
                     else:  # Gauge
                         metric.set(value)

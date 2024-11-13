@@ -92,7 +92,9 @@ services:
                         type: "gauge"
                         description: "Node synchronization time in seconds"
                         filter: "Sync Time: ([0-9.]+)s"
-                        value_on_error: 999
+                        labels:
+                            genesis_id:
+                                filter: "Genesis ID: ([\\w-\\.]+)"
             data_store:
                 command: "du -sb /var/lib/algorand"
                 metrics:
