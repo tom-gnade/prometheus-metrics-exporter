@@ -440,9 +440,9 @@ class ProgramLogger:
     ):
         self.source = source
         self.config = config
-        self._logger = self._setup_logging()
         self._handlers = {}
-
+        self._logger = self._setup_logging()
+        
     @property
     def logger(self) -> logging.Logger:
         """Get the configured logger instance."""
