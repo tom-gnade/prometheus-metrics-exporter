@@ -232,13 +232,6 @@ class ProgramConfig:
     should be used to get the current time, and all stored timestamps
     should be UTC-aware datetime objects.
     """
-    _source: ProgramSource
-    _config: Dict[str, Any] = field(init=False)
-    _last_load_time: float = field(init=False, default=0)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
-    _running_under_systemd: bool = field(init=False)
-    _start_time: datetime = field(init=False)
-
     REQUIRED_SECTIONS = {'services'}
     DEFAULT_VALUES = {
         'exporter': {
@@ -264,11 +257,18 @@ class ProgramConfig:
         }
     }
 
-    def __post_init__(self):
-        """Initial load of configuration."""
-        self._start_time = self.now_utc()
-        self._running_under_systemd = bool(os.getenv('INVOCATION_ID'))
-        self.load()
+    def __init__(self, source: ProgramSource):
+        """Initialize configuration manager."""
+        self._source = source
+        self._config: Dict[str, Any] = {}
+        self._initial_exporter: Dict[str, Any] = {}
+        self._last_load_time: float = 0
+        self._lock: threading.Lock = threading.Lock()
+        self._running_under_systemd: bool = bool(os.getenv('INVOCATION_ID'))
+        self._start_time: datetime = self.now_utc()
+        
+        # Perform initial load
+        self.load(initial_load=True)
 
     @staticmethod
     def now_utc() -> datetime:
@@ -345,151 +345,93 @@ class ProgramConfig:
         """Get service configuration by name."""
         return self.services.get(name)
 
-    def get_service_metrics(self, service_name: str, group_name: str) -> Dict[str, Any]:
-        """Get metrics configuration for a service group."""
-        service = self.get_service(service_name)
-        if not service:
-            return {}
-        return service.get('metric_groups', {}).get(group_name, {}).get('metrics', {})
-
-    def _merge_defaults(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge configuration with default values."""
-        result = deepcopy(self.DEFAULT_VALUES)
-
-        # Only merge exporter section if present
-        if 'exporter' in config:
-            for key, value in config['exporter'].items():
-                if isinstance(value, dict) and key in result['exporter']:
-                    result['exporter'][key].update(value)
-                else:
-                    result['exporter'][key] = value
-        
-        # Services section is required and not defaulted
-        result['services'] = config['services']
-        
-        return result
-
-    def _validate_metric_config(self, metric_name: str, metric_config: Dict[str, Any]) -> None:
-        """Validate individual metric configuration."""
-        if 'type' not in metric_config:  # Add this check
-            raise MetricConfigurationError(
-                f"Metric {metric_name} missing required field: type"
-            )
-
-        if 'description' not in metric_config:
-            raise MetricConfigurationError(
-                f"Metric {metric_name} missing required field: description"
-            )
-        
-        # Validate metric type
-        metric_type = MetricType.from_config(metric_config)
-        
-        if metric_type == MetricType.STATIC:
-            if 'value' not in metric_config:
-                raise MetricConfigurationError(
-                    f"Static metric {metric_name} must specify a value"
-                )
-            if 'filter' in metric_config:
-                raise MetricConfigurationError(
-                    f"Static metric {metric_name} cannot have a filter"
-                )
-        else:  # gauge or counter
-            if 'value' in metric_config:
-                raise MetricConfigurationError(
-                    f"{metric_type.value} metric {metric_name} cannot have a static value"
-                )
-            if 'filter' not in metric_config:
-                raise MetricConfigurationError(
-                    f"{metric_type.value} metric {metric_name} must specify a filter"
-                )
-
-    def _validate_config(self, config: Dict[str, Any]) -> None:
-        """Validate configuration structure and types."""
-        if not config:
-            raise MetricConfigurationError("Empty configuration")
-            
-        # Validate required services section
-        if 'services' not in config:
-            raise MetricConfigurationError("Missing required 'services' section")
-        
-        services = config['services']
-        if not isinstance(services, dict):
-            raise MetricConfigurationError("Services section must be a dictionary")
-            
-        if not services:
-            raise MetricConfigurationError("At least one service must be defined")
-        
-        # Validate each service has at least one metric group with metrics
-        for service_name, service_config in services.items():
-            if not isinstance(service_config, dict):
-                raise MetricConfigurationError(
-                    f"Service {service_name} configuration must be a dictionary"
-                )
-
-            metric_groups = service_config.get('metric_groups', {})
-            if not metric_groups:
-                raise MetricConfigurationError(
-                    f"Service '{service_name}' must define at least one metric group"
-                )
-                
-            for group_name, group_config in metric_groups.items():
-                if not isinstance(group_config, dict):
-                    raise MetricConfigurationError(
-                        f"Metric group '{group_name}' in service '{service_name}' "
-                        "must be a dictionary"
-                    )
-                    
-                metrics = group_config.get('metrics', {})
-                if not metrics:
-                    raise MetricConfigurationError(
-                        f"Metric group '{group_name}' in service '{service_name}' "
-                        "must define at least one metric"
-                    )
-                    
-                for metric_name, metric_config in metrics.items():
-                    self._validate_metric_config(metric_name, metric_config)
-
-            # Validate optional exporter section if present
-        if 'exporter' in config:
-            exporter = config['exporter']
-            metrics_port = exporter.get('metrics_port', 0)
-            health_port = exporter.get('health_port', 0)
-
-            if not isinstance(metrics_port, int) or metrics_port < 1 or metrics_port > 65535:
-                raise MetricConfigurationError("Metrics port must be a valid port number (1-65535)")
-
-            if not isinstance(health_port, int) or health_port < 1 or health_port > 65535:
-                raise MetricConfigurationError("Health check port must be a valid port number (1-65535)")
-
-            if metrics_port == health_port:
-                raise MetricConfigurationError("Metrics and health check ports must be different")
-
-            collection = exporter.get('collection', {})
-            if not isinstance(collection.get('poll_interval_sec', 0), (int, float)):
-                raise MetricConfigurationError("Poll interval must be a number")
-
-    def load(self) -> None:
-        """Load configuration from file with thread safety."""
+    def load(self, initial_load: bool = False) -> None:
+        """Load configuration with thread safety."""
         with self._lock:
             try:
                 with open(self._source.config_path) as f:
                     config = yaml.safe_load(f)
                     if config is None:
                         raise MetricConfigurationError("Empty configuration file")
+
+                # Start with default values
+                validated = deepcopy(self.DEFAULT_VALUES)
                 
-                self._validate_config(config)
-                config = self._merge_defaults(config)
+                # Handle exporter section
+                if 'exporter' in config:
+                    if initial_load:
+                        # Store initial exporter config
+                        validated['exporter'].update(config['exporter'])
+                        self._initial_exporter = deepcopy(config['exporter'])
+                    else:
+                        # Compare with initial config
+                        current_exporter = config.get('exporter', {})
+                        if current_exporter != self._initial_exporter:
+                            changed_fields = [
+                                k for k, v in current_exporter.items()
+                                if self._initial_exporter.get(k) != v
+                            ]
+                            if changed_fields:
+                                self.logger.warning(
+                                    f"Changes detected in exporter section fields: {', '.join(changed_fields)}. "
+                                    "These changes will be ignored. Restart the service to apply changes."
+                                )
+                        # Keep current exporter config
+                        validated['exporter'] = deepcopy(self._config['exporter'])
+
+                # Handle services section
+                if 'services' not in config:
+                    raise MetricConfigurationError("Missing required 'services' section")
+
+                validated['services'] = {}
+                valid_services = 0
+                invalid_services = 0
                 
-                self._config = config
+                for service_name, service_config in config['services'].items():
+                    try:
+                        validated_service = self._validate_service(service_name, service_config)
+                        if validated_service:
+                            validated['services'][service_name] = validated_service
+                            valid_services += 1
+                        else:
+                            invalid_services += 1
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Failed to validate service '{service_name}': {e}. "
+                            "Skipping this service but continuing with others."
+                        )
+                        invalid_services += 1
+
+                if valid_services == 0:
+                    if initial_load:
+                        raise MetricConfigurationError("No valid services found in initial configuration")
+                    self.logger.error(
+                        "No valid services found in new configuration. "
+                        "Keeping current service configuration."
+                    )
+                    validated['services'] = self._config['services']
+                elif invalid_services > 0:
+                    self.logger.warning(
+                        f"Partially valid configuration: {valid_services} valid services, "
+                        f"{invalid_services} invalid services"
+                    )
+
+                # Update configuration
+                self._config = validated
                 self._last_load_time = self._source.config_path.stat().st_mtime
                 
                 self.logger.info(
-                    f"Configuration loaded successfully at {self.now_utc().isoformat()}"
+                    f"Configuration {'loaded' if initial_load else 'reloaded'} "
+                    f"successfully at {self.now_utc().isoformat()}"
                 )
 
             except Exception as e:
-                if not hasattr(self, '_config'):
+                if initial_load:
                     raise MetricConfigurationError(f"Failed to load initial config: {e}")
+                self.logger.error(
+                    f"Failed to reload configuration: {e}. "
+                    "Continuing with previous configuration."
+                )
 
     def _check_reload(self) -> None:
         """Check if config file has been modified and reload if needed."""
@@ -497,8 +439,204 @@ class ProgramConfig:
             current_mtime = self._source.config_path.stat().st_mtime
             if current_mtime > self._last_load_time:
                 self.load()
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.error(f"Failed to check configuration reload: {e}")
+
+    def _validate_service(
+        self,
+        service_name: str,
+        service_config: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Validate service configuration optimistically."""
+        if not isinstance(service_config, dict):
+            self.logger.warning(
+                f"Service '{service_name}' configuration must be a dictionary, got {type(service_config)}"
+            )
+            return None
+
+        validated = {}
+        
+        # Copy basic service properties
+        for key in ['description', 'run_as']:
+            if key in service_config:
+                validated[key] = service_config[key]
+
+        # Handle metric groups optimistically
+        if 'metric_groups' not in service_config:
+            self.logger.warning(f"No metric groups defined for service '{service_name}'")
+            return None
+
+        validated['metric_groups'] = {}
+        valid_groups = 0
+        invalid_groups = 0
+        
+        for group_name, group_config in service_config['metric_groups'].items():
+            try:
+                validated_group = self._validate_metric_group(
+                    service_name, 
+                    group_name, 
+                    group_config
+                )
+                if validated_group:
+                    validated['metric_groups'][group_name] = validated_group
+                    valid_groups += 1
+                else:
+                    invalid_groups += 1
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to validate metric group '{group_name}' in service '{service_name}': {e}"
+                )
+                invalid_groups += 1
+                continue
+
+        if valid_groups > 0:
+            if invalid_groups > 0:
+                self.logger.warning(
+                    f"Service '{service_name}' partially valid: {valid_groups} valid groups, "
+                    f"{invalid_groups} invalid groups"
+                )
+            return validated
+        else:
+            self.logger.warning(
+                f"Service '{service_name}' has no valid metric groups "
+                f"(attempted to parse {invalid_groups} groups)"
+            )
+            return None
+
+    def _validate_metric_group(
+        self,
+        service_name: str,
+        group_name: str,
+        group_config: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Validate metric group configuration optimistically."""
+        if not isinstance(group_config, dict):
+            self.logger.warning(f"Metric group '{group_name}' configuration must be a dictionary")
+            return None
+
+        validated = {}
+        
+        # Copy group properties
+        for field in ['command', 'content_type', 'collection_frequency']:
+            if field in group_config:
+                validated[field] = group_config[field]
+
+        # Handle metrics optimistically
+        if 'metrics' not in group_config:
+            self.logger.warning(
+                f"No metrics defined in group '{group_name}' for service '{service_name}'"
+            )
+            return None
+
+        validated['metrics'] = {}
+        valid_metrics = 0
+        invalid_metrics = 0
+        static_metrics = 0
+        
+        for metric_name, metric_config in group_config['metrics'].items():
+            try:
+                validated_metric = self._validate_metric(
+                    service_name,
+                    group_name,
+                    metric_name,
+                    metric_config
+                )
+                if validated_metric:
+                    if validated_metric.get('type') == 'static':
+                        static_metrics += 1
+                    validated['metrics'][metric_name] = validated_metric
+                    valid_metrics += 1
+                else:
+                    invalid_metrics += 1
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to validate metric '{metric_name}' in group '{group_name}': {e}"
+                )
+                invalid_metrics += 1
+                continue
+
+        # Validate we either have a command or all metrics are static
+        if 'command' not in validated and static_metrics < len(validated['metrics']):
+            self.logger.warning(
+                f"Metric group '{group_name}' missing command and has non-static metrics"
+            )
+            return None
+
+        if valid_metrics > 0:
+            if invalid_metrics > 0:
+                self.logger.warning(
+                    f"Metric group '{group_name}' partially valid: {valid_metrics} valid metrics, "
+                    f"{invalid_metrics} invalid metrics"
+                )
+            return validated
+        else:
+            self.logger.warning(
+                f"Metric group '{group_name}' has no valid metrics "
+                f"(attempted to parse {invalid_metrics} metrics)"
+            )
+            return None
+
+    def _validate_metric(
+        self,
+        service_name: str,
+        group_name: str,
+        metric_name: str,
+        metric_config: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Validate individual metric configuration."""
+        if not isinstance(metric_config, dict):
+            self.logger.warning(f"Metric '{metric_name}' configuration must be a dictionary")
+            return None
+
+        validated = {}
+        
+        # Required fields
+        if 'type' not in metric_config:
+            self.logger.warning(f"Metric '{metric_name}' missing required field: type")
+            return None
+            
+        if 'description' not in metric_config:
+            self.logger.warning(f"Metric '{metric_name}' missing required field: description")
+            return None
+
+        validated['type'] = metric_config['type']
+        validated['description'] = metric_config['description']
+
+        # Type-specific validation
+        try:
+            metric_type = MetricType.from_config(metric_config)
+            
+            if metric_type == MetricType.STATIC:
+                if 'value' not in metric_config:
+                    self.logger.warning(f"Static metric '{metric_name}' must specify a value")
+                    return None
+                    
+                try:
+                    validated['value'] = float(metric_config['value'])
+                except (TypeError, ValueError):
+                    self.logger.warning(
+                        f"Static metric '{metric_name}' has invalid value: {metric_config['value']}"
+                    )
+                    return None
+                    
+            else:  # gauge or counter
+                if 'filter' not in metric_config:
+                    self.logger.warning(
+                        f"{metric_type.value} metric '{metric_name}' must specify a filter"
+                    )
+                    return None
+                validated['filter'] = metric_config['filter']
+
+            # Optional fields
+            for field in ['content_type', 'value_on_error', 'collection_frequency']:
+                if field in metric_config:
+                    validated[field] = metric_config[field]
+
+            return validated
+
+        except Exception as e:
+            self.logger.warning(f"Failed to validate metric '{metric_name}': {e}")
+            return None
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -628,6 +766,8 @@ class MetricType(Enum):
         # Default to gauge unless static value present
         return cls.STATIC if 'value' in config else cls.GAUGE
 
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
 @dataclass(frozen=True, eq=True)
 class MetricIdentifier:
     """Structured metric identifier."""
@@ -641,6 +781,8 @@ class MetricIdentifier:
     def prometheus_name(self) -> str:
         """Get prometheus-compatible metric name."""
         return f"{self.service}_{self.group}_{self.name}"
+
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
 class ContentType(Enum):
     """Content types for data sources."""
@@ -696,12 +838,16 @@ class ContentType(Enum):
             logger.warning(f"Failed to parse {self.value} response: {e}")
             return None
 
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
 @dataclass
 class CollectionResult:
     """Result of metric collection attempt."""
     success: bool
     value: Optional[float] = None
     error: Optional[str] = None
+
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
 @dataclass
 class CollectionStats:
@@ -756,6 +902,8 @@ class CollectionStats:
     def is_healthy(self, threshold: int) -> bool:
         """Determine if collection statistics indicate healthy operation."""
         return self.consecutive_failures < threshold
+
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
 @dataclass
 class CommandResult:
@@ -1894,3 +2042,5 @@ async def main():
 
 if __name__ == '__main__':
     sys.exit(asyncio.run(main()))
+    
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
