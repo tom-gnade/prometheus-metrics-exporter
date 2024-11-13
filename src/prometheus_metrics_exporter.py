@@ -1420,13 +1420,14 @@ class ServiceMetricsCollector:
                     self.logger.debug(f"Skipping unexposed group: {group_name}")
                     continue
 
-                # First, handle static metrics for this group
+                # First collect static metrics from this group
                 for metric_name, metric_config in group_config.get('metrics', {}).items():
                     try:
                         metric_type = MetricType.from_config(metric_config)
-                        self.logger.debug(f"Checking metric {metric_name}, type: {metric_type}")
+                        self.logger.debug(f"Processing metric {metric_name}, type: {metric_type}")
                         
                         if metric_type == MetricType.STATIC:
+                            self.logger.debug(f"Found static metric: {metric_name}")
                             identifier = MetricIdentifier(
                                 service=self.service_name,
                                 group=group_name,
@@ -1438,9 +1439,9 @@ class ServiceMetricsCollector:
                             results[identifier] = value
                             self.logger.debug(f"Added static metric to results: {identifier.prometheus_name} = {value}")
                     except Exception as e:
-                        self.logger.error(f"Failed to process static metric {metric_name}: {e}", exc_info=True)
-                
-                # Then handle dynamic metrics that need command execution
+                        self.logger.error(f"Failed to process static metric {metric_name}: {e}")
+
+                # Then collect dynamic metrics
                 try:
                     self.logger.debug(f"Collecting dynamic metrics for group: {group_name}")
                     group_metrics = await self.collect_group(group_name, group_config)
@@ -1449,7 +1450,7 @@ class ServiceMetricsCollector:
                 except Exception as e:
                     self.logger.error(f"Failed to collect metric group {group_name}: {e}")
             
-            self.logger.debug(f"Service {self.service_name} final results: {results}")
+            self.logger.debug(f"Service {self.service_name} final collection results: {results}")
             return results
     
     async def collect_group(
