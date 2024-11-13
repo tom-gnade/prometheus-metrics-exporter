@@ -1562,7 +1562,7 @@ class ServiceMetricsCollector:
                 self.logger.error(f"Failed to collect group {group_name}: {e}")
                 return {}
     
-    def _parse_metric_value(
+def _parse_metric_value(
         self,
         source_data: str,
         metric_config: Dict,
@@ -1570,13 +1570,6 @@ class ServiceMetricsCollector:
     ) -> Optional[float]:
         """Parse individual metric value from group's source data."""
         try:
-            # Handle static metrics
-            if metric_type == MetricType.STATIC:
-                if 'value' not in metric_config:
-                    self.logger.error("Static metric must specify a value")
-                    return None
-                return float(metric_config['value'])
-            
             # Handle gauge and counter metrics
             if source_data is None:
                 self.logger.debug("No source data available")
@@ -2312,7 +2305,7 @@ class MetricsExporter:
             self.logger.info("Service shutdown complete")
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
- 
+
 async def main():
     """Entry point for the metrics exporter service."""
     exporter = None
