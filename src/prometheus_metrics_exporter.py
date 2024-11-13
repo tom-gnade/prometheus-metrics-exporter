@@ -19,6 +19,7 @@ Configuration:
 
 exporter:
     metrics_port: 9101  # Prometheus metrics port
+    health_port: 9102 # Health check port
     user: prometheus # User to run commands as
     collection:
         poll_interval_sec: 5  # Global collection interval
@@ -44,6 +45,7 @@ services:
                 command: "shell command that produces output"  # Command to execute
                 metrics:
                     metric_name:
+                        type: "gauge|static|counter" # Required metric type declaration
                         description: "Metric description"
                         filter: "regex or jq-style filter"  # Text regex or JSON filter
                         content_type: "text|json"  # How to parse command output, default text
@@ -174,6 +176,8 @@ class ProgramSource:
         """Full path to sudoers configuration file."""
         return Path("/etc/sudoers.d") / self.sudoers_file
 
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
 @dataclass
 class ProgramConfig:
     """Program configuration with dynamic reloading support."""
@@ -256,6 +260,11 @@ class ProgramConfig:
         return self.exporter['metrics_port']
     
     @property
+    def health_port(self) -> int:
+        """Health check server port."""
+        return self.exporter['health_port']
+    
+    @property
     def poll_interval(self) -> int:
         """Collection polling interval."""
         return self.collection.get('poll_interval_sec', 5)
@@ -291,6 +300,40 @@ class ProgramConfig:
                 result[key] = value
         return result
 
+    def _validate_metric_config(self, metric_name: str, metric_config: Dict[str, Any]) -> None:
+        """Validate individual metric configuration."""
+        if 'type' not in metric_config:  # Add this check
+            raise MetricConfigurationError(
+                f"Metric {metric_name} missing required field: type"
+            )
+
+        if 'description' not in metric_config:
+            raise MetricConfigurationError(
+                f"Metric {metric_name} missing required field: description"
+            )
+        
+        # Validate metric type
+        metric_type = MetricType.from_config(metric_config)
+        
+        if metric_type == MetricType.STATIC:
+            if 'value' not in metric_config:
+                raise MetricConfigurationError(
+                    f"Static metric {metric_name} must specify a value"
+                )
+            if 'filter' in metric_config:
+                raise MetricConfigurationError(
+                    f"Static metric {metric_name} cannot have a filter"
+                )
+        else:  # gauge or counter
+            if 'value' in metric_config:
+                raise MetricConfigurationError(
+                    f"{metric_type.value} metric {metric_name} cannot have a static value"
+                )
+            if 'filter' not in metric_config:
+                raise MetricConfigurationError(
+                    f"{metric_type.value} metric {metric_name} must specify a filter"
+                )
+
     def _validate_config(self, config: Dict[str, Any]) -> None:
         """Validate configuration structure and types."""
         if not config:
@@ -319,6 +362,12 @@ class ProgramConfig:
                     f"Service {service_name} configuration must be a dictionary"
                 )
 
+        # Validate metrics configuration
+        for service_name, service_config in services.items():
+            for group_name, group_config in service_config.get('metric_groups', {}).items():
+                for metric_name, metric_config in group_config.get('metrics', {}).items():
+                    self._validate_metric_config(metric_name, metric_config)
+
     def load(self) -> None:
         """Load configuration from file with thread safety."""
         with self._lock:
@@ -344,6 +393,8 @@ class ProgramConfig:
                 self.load()
         except Exception:
             pass
+
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
 class ProgramLogger:
     """Manages logging configuration and setup."""
@@ -448,6 +499,8 @@ class ProgramLogger:
         
         return logger
 
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
 class MetricType(Enum):
     """Types of metrics supported."""
     GAUGE = "gauge"    # A value that can go up and down (default)
@@ -468,6 +521,20 @@ class MetricType(Enum):
         
         # Default to gauge unless static value present
         return cls.STATIC if 'value' in config else cls.GAUGE
+
+@dataclass(frozen=True, eq=True)
+class MetricIdentifier:
+    """Structured metric identifier."""
+    service: str
+    group: str
+    name: str
+    type: MetricType
+    description: str
+
+    @property
+    def prometheus_name(self) -> str:
+        """Get prometheus-compatible metric name."""
+        return f"{self.service}_{self.group}_{self.name}"
 
 class ContentType(Enum):
     """Content types for data sources."""
@@ -676,6 +743,8 @@ class ServiceUserManager:
             
         return True
 
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
 class UserContext:
     """Manages user context for command execution."""
     
@@ -724,7 +793,7 @@ class UserContext:
             )
             raise
         
-        #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Command Execution
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -808,7 +877,7 @@ class CollectionManager:
     async def collect_services(
         self,
         collectors: Dict[str, 'ServiceMetricsCollector']
-    ) -> Dict[str, Dict[str, float]]:
+    ) -> Dict[str, Dict[MetricIdentifier, float]]:
         """Collect metrics from multiple services in parallel."""
         tasks = []
         service_names = []
@@ -845,6 +914,8 @@ class CollectionManager:
             self.logger.error(f"Collection failed for {identifier}: {e}")
             return None
 
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
 class ServiceMetricsCollector:
     """Collects metrics for a specific service."""
     
@@ -868,7 +939,7 @@ class ServiceMetricsCollector:
             except Exception as e:
                 self.logger.error(f"Failed to initialize user context for {service_name}: {e}")
     
-    async def collect_metrics(self) -> Dict[str, float]:
+    async def collect_metrics(self) -> Dict[MetricIdentifier, float]:
         """Collect all metrics for this service."""
         results = {}
         self.logger.debug(f"Starting metrics collection for service: {self.service_name}")
@@ -894,41 +965,42 @@ class ServiceMetricsCollector:
         self,
         group_name: str,
         group_config: Dict
-    ) -> Dict[str, float]:
+    ) -> Dict[MetricIdentifier, float]:
         """Collect all metrics in a group from a single source read."""
         self.logger.debug(f"Starting collection for group {group_name}")
         
         try:
             # Get the source data for the group
             command = group_config.get('command')
-            if command:
-                result = await self.command_executor.execute_command(
-                    command,
-                    self.user_context
-                )
-            else:
+            if not command:
                 self.logger.debug(f"No command specified for group {group_name}")
                 return {}
-            
-            source_data = result.output if result.success else None
-            self.logger.debug(f"Command execution result: {result}")
 
+            result = await self.command_executor.execute_command(
+                command,
+                self.user_context
+            )
+
+            source_data = result.output if result.success else None
             if source_data is None:
                 self.logger.debug(f"No source data for group {group_name}")
                 return {}
-            
+
             results = {}
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    # Construct full metric name from path components
-                    full_metric_name = f"{self.service_name}_{group_name}_{metric_name}"
-                    self.logger.debug(f"Processing metric: {full_metric_name}")
-                    
-                    # Get value based on metric type
-                    value = self._parse_metric_value(source_data, metric_config)
-                    
+                    metric_type = MetricType.from_config(metric_config)
+                    identifier = MetricIdentifier(
+                        service=self.service_name,
+                        group=group_name,
+                        name=metric_name,
+                        type=metric_type,
+                        description=metric_config.get('description', f'Metric {metric_name}')
+                    )
+
+                    value = self._parse_metric_value(source_data, metric_config, metric_type)
                     if value is not None:
-                        results[full_metric_name] = value
+                        results[identifier] = value
 
                 except Exception as e:
                     self.logger.error(f"Failed to parse metric {metric_name}: {e}")
@@ -942,20 +1014,27 @@ class ServiceMetricsCollector:
     def _parse_metric_value(
         self,
         source_data: str,
-        metric_config: Dict
+        metric_config: Dict,
+        metric_type: MetricType
     ) -> Optional[float]:
         """Parse individual metric value from group's source data."""
         try:
-            # Infer static type if value is present
-            if 'value' in metric_config:
-                self.logger.debug("Processing static metric with value: %s", metric_config['value'])
+            # Handle static metrics
+            if metric_type == MetricType.STATIC:
+                if 'value' not in metric_config:
+                    self.logger.error("Static metric must specify a value")
+                    return None
                 return float(metric_config['value'])
             
-            # All other metrics are gauges using the filter
+            # Handle gauge and counter metrics
             if source_data is None:
                 self.logger.debug("No source data available")
                 return metric_config.get('value_on_error')
             
+            if 'filter' not in metric_config:
+                self.logger.error(f"{metric_type.value} metric must specify a filter")
+                return None
+
             content_type = metric_config.get('content_type', 'text')
             content_type_enum = ContentType(content_type)
             value = content_type_enum.parse_value(
@@ -975,6 +1054,8 @@ class ServiceMetricsCollector:
                 return metric_config['value_on_error']
             return None
 
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
 class MetricsCollector:
     """Main metrics collector managing multiple services."""
     
@@ -983,8 +1064,9 @@ class MetricsCollector:
         self.logger = logger
         self.stats = CollectionStats()
         self.service_collectors: Dict[str, ServiceMetricsCollector] = {}
-        self._prometheus_metrics: Dict[str, Union[Gauge, Counter]] = {}
-        self._previous_values: Dict[str, float] = {}
+
+        self._prometheus_metrics: Dict[MetricIdentifier, Union[Gauge, Counter]] = {}
+        self._previous_values: Dict[MetricIdentifier, float] = {}
         self.start_time = datetime.now()
         self.collection_manager = CollectionManager(config, logger)
         
@@ -1092,16 +1174,30 @@ class MetricsCollector:
             self.logger.error(f"Failed to collect metrics: {e}")
             return False
     
-    def _update_prometheus_metrics(self, metrics: Dict[str, float]):
+    def _create_prometheus_metric(
+        self,
+        identifier: MetricIdentifier
+    ) -> Union[Gauge, Counter]:
+        """Create appropriate Prometheus metric based on type."""
+        if identifier.type == MetricType.COUNTER:
+            return Counter(identifier.prometheus_name, identifier.description)
+        return Gauge(identifier.prometheus_name, identifier.description)
+
+    def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
         """Update Prometheus metrics with collected values."""
-        for metric_name, value in metrics.items():
-            if metric_name not in self._prometheus_metrics:
-                self._prometheus_metrics[metric_name] = Gauge(
-                    metric_name,
-                    self._get_metric_description(metric_name)
-                )
+        for identifier, value in metrics.items():
+            if identifier not in self._prometheus_metrics:
+                self._prometheus_metrics[identifier] = self._create_prometheus_metric(identifier)
+            
             if value is not None:
-                self._prometheus_metrics[metric_name].set(value)
+                metric = self._prometheus_metrics[identifier]
+                if identifier.type == MetricType.COUNTER:
+                    prev_value = self._previous_values.get(identifier, 0)
+                    if value > prev_value:
+                        metric.inc(value - prev_value)
+                    self._previous_values[identifier] = value
+                else:
+                    metric.set(value)
     
     def _update_internal_metrics(self, successes: int, errors: int, duration: float):
         """Update internal metrics."""
@@ -1110,15 +1206,6 @@ class MetricsCollector:
         self._internal_metrics['collection_duration'].set(duration)
         self._internal_metrics['uptime'].set(self.get_uptime())
     
-    def _get_metric_description(self, metric_name: str) -> str:
-        """Get description for a metric from configuration."""
-        for collector in self.service_collectors.values():
-            for group in collector.service_config.get('metric_groups', {}).values():
-                for metric in group.get('metrics', {}).values():
-                    if f"{collector.service_name}_{metric_name}" == metric_name:
-                        return metric.get('description', f"Metric {metric_name}")
-        return f"Metric {metric_name}"
-
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Main Service Class and Entry Point
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
@@ -1181,7 +1268,10 @@ class MetricsExporter:
 
     def check_ports(self) -> bool:
         """Check if required ports are available."""
-        ports = [self.config.metrics_port]
+        ports = [
+            self.config.metrics_port,
+            self.config.health_port
+        ]
         
         for port in ports:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1206,7 +1296,7 @@ class MetricsExporter:
             # Start Prometheus metrics server
             try:
                 start_http_server(self.config.metrics_port)
-                self.logger.info(f"Started Prometheus metrics server on port {self.config.port}")
+                self.logger.info(f"Started Prometheus metrics server on port {self.config.metrics_port}")
             except Exception as e:
                 self.logger.error(f"Failed to start metrics server: {e}")
                 if self.config.running_under_systemd:
@@ -1250,6 +1340,8 @@ class MetricsExporter:
             
         finally:
             self.logger.info("Service shutdown complete")
+
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
 async def main():
     """Entry point for the metrics exporter service."""

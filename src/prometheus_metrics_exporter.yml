@@ -10,6 +10,7 @@
 # Exporter Configuration
 exporter:
     metrics_port: 9101
+    health_port: 9102
     collection:
         poll_interval_sec: 5 # Global polling interval, override with collection_frequency (template, service, metric_group)
     logging:
@@ -25,6 +26,7 @@ services:
                 command: "/usr/bin/goal node status -d /var/lib/algorand"
                 metrics:
                     sync_time:
+                        type: "gauge"
                         description: "Node synchronization time in seconds"
                         filter: "Sync Time: ([0-9.]+)s"
                         value_on_error: 999
@@ -32,5 +34,6 @@ services:
                 command: "du -sb /var/lib/algorand"
                 metrics:
                     bytes:
+                        type: "gauge"
                         description: "Algorand data storage directory size"
                         filter: "^(\\d+)"
