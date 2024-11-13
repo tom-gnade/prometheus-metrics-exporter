@@ -1562,41 +1562,41 @@ class ServiceMetricsCollector:
                 self.logger.error(f"Failed to collect group {group_name}: {e}")
                 return {}
     
-def _parse_metric_value(
-        self,
-        source_data: str,
-        metric_config: Dict,
-        metric_type: MetricType
-    ) -> Optional[float]:
-        """Parse individual metric value from group's source data."""
-        try:
-            # Handle gauge and counter metrics
-            if source_data is None:
-                self.logger.debug("No source data available")
-                return metric_config.get('value_on_error')
-            
-            if 'filter' not in metric_config:
-                self.logger.error(f"{metric_type.value} metric must specify a filter")
-                return None
+    def _parse_metric_value(
+            self,
+            source_data: str,
+            metric_config: Dict,
+            metric_type: MetricType
+        ) -> Optional[float]:
+            """Parse individual metric value from group's source data."""
+            try:
+                # Handle gauge and counter metrics
+                if source_data is None:
+                    self.logger.debug("No source data available")
+                    return metric_config.get('value_on_error')
+                
+                if 'filter' not in metric_config:
+                    self.logger.error(f"{metric_type.value} metric must specify a filter")
+                    return None
 
-            content_type = metric_config.get('content_type', 'text')
-            content_type_enum = ContentType(content_type)
-            value = content_type_enum.parse_value(
-                source_data,
-                metric_config['filter'],
-                self.logger
-            )
-            
-            if value is None and 'value_on_error' in metric_config:
-                return metric_config['value_on_error']
-            
-            return value
-            
-        except Exception as e:
-            self.logger.error(f"Failed to parse value: {e}")
-            if 'value_on_error' in metric_config:
-                return metric_config['value_on_error']
-            return None
+                content_type = metric_config.get('content_type', 'text')
+                content_type_enum = ContentType(content_type)
+                value = content_type_enum.parse_value(
+                    source_data,
+                    metric_config['filter'],
+                    self.logger
+                )
+                
+                if value is None and 'value_on_error' in metric_config:
+                    return metric_config['value_on_error']
+                
+                return value
+                
+            except Exception as e:
+                self.logger.error(f"Failed to parse value: {e}")
+                if 'value_on_error' in metric_config:
+                    return metric_config['value_on_error']
+                return None
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -1674,13 +1674,10 @@ class MetricsCollector:
             
             # Process results from each service
             for service_name, metrics in service_results.items():
-                if isinstance(metrics, Dict):
+                if isinstance(metrics, Dict) and metrics:  # Check if we got any metrics
                     success_count += len(metrics)
-                    self._update_prometheus_metrics(metrics)
                 else:
-                    self.logger.error(
-                        f"Failed to collect metrics for {service_name}"
-                    )
+                    self.logger.error(f"Failed to collect metrics for {service_name}")
                     errors += 1
             
             # Update statistics
@@ -1688,7 +1685,7 @@ class MetricsCollector:
             self.stats.successful += success_count
             self.stats.errors += errors
             
-            if errors == len(self.service_collectors):
+            if success_count == 0:  # If no metrics were collected successfully
                 self.stats.consecutive_failures += 1
             else:
                 self.stats.consecutive_failures = 0
@@ -1698,10 +1695,10 @@ class MetricsCollector:
             # Update internal metrics
             self._update_internal_metrics(success_count, errors, collection_time)
             
-            success_rate = (
-                (success_count / (success_count + errors) * 100)
-                if (success_count + errors) > 0 else 0
-            )
+            success_rate = 0.0
+            total_metrics = success_count + errors
+            if total_metrics > 0:
+                success_rate = (success_count / total_metrics) * 100
             
             self.logger.info(
                 f"Metrics collection completed in {collection_time:.2f}s: "
