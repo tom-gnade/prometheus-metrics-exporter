@@ -472,63 +472,95 @@ class ProgramConfig:
         return validated
 
     def _validate_metric_group(
-            self,
-            service_name: str,
-            group_name: str,
-            group_config: Dict[str, Any]
-        ) -> Optional[Dict[str, Any]]:
-            """Validate metric group configuration."""
-            if not isinstance(group_config, dict):
-                raise MetricConfigurationError("Must be a dictionary")
+        self,
+        service_name: str,
+        group_name: str,
+        group_config: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Validate metric group configuration."""
+        if not isinstance(group_config, dict):
+            raise MetricConfigurationError("Must be a dictionary")
 
-            self.logger.debug(f"Validating metric group {group_name} in service {service_name}")
-            self.logger.debug(f"Group config: {group_config}")
-            
-            validated = {}
-            validated['metrics'] = {}
-            static_metrics_only = True
-            
-            metrics = group_config.get('metrics', {})
-            self.logger.debug(f"Found {len(metrics)} metrics in group: {list(metrics.keys())}")
-            
-            for metric_name, metric_config in metrics.items():
+        self.logger.debug(f"Validating metric group {group_name} in service {service_name}")
+        validated = {'metrics': {}}
+        
+        # Determine group type
+        group_type = MetricGroupType.from_config(group_config)
+        validated['type'] = group_type.value
+        
+        if group_type == MetricGroupType.STATIC:
+            # Validate static metrics
+            for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    self.logger.debug(f"Validating metric {metric_name}: {metric_config}")
-                    validated_metric = self._validate_metric(
-                        service_name,
-                        group_name,
-                        metric_name,
-                        metric_config
-                    )
-                    if validated_metric:
-                        self.logger.debug(f"Validated metric {metric_name}: {validated_metric}")
-                        if validated_metric.get('type') != 'static':
-                            static_metrics_only = False
-                        validated['metrics'][metric_name] = validated_metric
-                        self._validation_stats['metrics']['valid'] += 1
-                    else:
-                        self.logger.debug(f"Metric {metric_name} validation returned None")
-                        self._validation_stats['metrics']['invalid'] += 1
+                    self.logger.debug(f"Validating static metric {metric_name}")
+                    
+                    # Ensure no metric_type is specified for static metrics
+                    if 'type' in metric_config:
+                        raise MetricConfigurationError(
+                            f"Static metric '{metric_name}' should not specify a type - "
+                            "it is implied by the static metric group"
+                        )
+                    
+                    if 'description' not in metric_config:
+                        raise MetricConfigurationError("Missing required field: description")
+                    if 'value' not in metric_config:
+                        raise MetricConfigurationError("Static metric must specify a value")
+                    
+                    validated['metrics'][metric_name] = {
+                        'description': metric_config['description'],
+                        'value': float(metric_config['value'])
+                    }
+                    self.logger.debug(f"Static metric {metric_name} validated successfully")
                 except Exception as e:
-                    self._validation_stats['metrics']['invalid'] += 1
-                    self.logger.error(f"Failed to validate metric '{metric_name}': {e}", exc_info=True)
+                    self.logger.error(f"Failed to validate static metric {metric_name}: {e}")
+                    raise
+        
+        else:  # DYNAMIC
+            # Validate dynamic metrics group
+            if 'command' not in group_config:
+                raise MetricConfigurationError("Dynamic metric group must specify a command")
+            validated['command'] = group_config['command']
+            
+            # Validate dynamic metrics
+            for metric_name, metric_config in group_config.get('metrics', {}).items():
+                try:
+                    self.logger.debug(f"Validating dynamic metric {metric_name}")
+                    
+                    # Ensure no static metrics in dynamic groups
+                    if metric_config.get('type', '').lower() == 'static':
+                        raise MetricConfigurationError(
+                            f"Static metric '{metric_name}' found in dynamic group '{group_name}'. "
+                            "Static metrics must be placed in a static metric group"
+                        )
+                    
+                    metric_type = MetricType.from_config(metric_config)
+                    if 'description' not in metric_config:
+                        raise MetricConfigurationError("Missing required field: description")
+                    if 'filter' not in metric_config:
+                        raise MetricConfigurationError(f"{metric_type.value} metric must specify a filter")
+                    
+                    validated['metrics'][metric_name] = {
+                        'type': metric_type.value,
+                        'description': metric_config['description'],
+                        'filter': metric_config['filter']
+                    }
+                    
+                    # Copy optional fields
+                    for field in ['content_type', 'value_on_error']:
+                        if field in metric_config:
+                            validated['metrics'][metric_name][field] = metric_config[field]
+                    
+                    self.logger.debug(f"Dynamic metric {metric_name} validated successfully")
+                except Exception as e:
+                    self.logger.error(f"Failed to validate dynamic metric {metric_name}: {e}")
+                    raise
 
-            self.logger.debug(f"Validated metrics for group {group_name}: {validated['metrics']}")
+        self.logger.debug(f"Validated metrics for group {group_name}: {validated['metrics']}")
 
-            if not validated['metrics']:
-                raise MetricConfigurationError("No valid metrics defined")
-
-            if 'command' in group_config:
-                validated['command'] = group_config['command']
-            elif not static_metrics_only:
-                raise MetricConfigurationError("Command required when group has non-static metrics")
-
-            for field in ['content_type', 'collection_frequency']:
-                if field in group_config:
-                    validated[field] = group_config[field]
-
-            self.logger.debug(f"Final validated group config: {validated}")
-            return validated
+        if not validated['metrics']:
+            raise MetricConfigurationError("No valid metrics defined")
+            
+        return validated
 
     def _validate_metric(
             self,
@@ -936,26 +968,46 @@ class ProgramLogger:
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
-class MetricType(Enum):
-    """Types of metrics supported."""
-    GAUGE = "gauge"    # A value that can go up and down (default)
-    STATIC = "static"  # Fixed value that rarely changes
-    COUNTER = "counter" # Value that only increases
+class MetricGroupType(Enum):
+    """Types of metric groups supported."""
+    STATIC = "static"     # Group containing only static values
+    DYNAMIC = "dynamic"   # Group requiring command execution
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> 'MetricType':
-        """Get metric type from config."""
+    def from_config(cls, config: Dict[str, Any]) -> 'MetricGroupType':
+        """Get metric group type from config."""
         if 'type' in config:
             try:
                 return cls(config['type'].lower())
             except ValueError:
                 raise MetricConfigurationError(
-                    f"Invalid metric type: {config['type']}. "
+                    f"Invalid metric group type: {config['type']}. "
                     f"Must be one of: {[t.value for t in cls]}"
                 )
         
-        # Default to gauge unless static value present
-        return cls.STATIC if 'value' in config else cls.GAUGE
+        # Default to dynamic if not specified
+        return cls.DYNAMIC
+    
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
+class MetricType(Enum):
+    """Types of metrics supported for dynamic groups."""
+    GAUGE = "gauge"      # A value that can go up and down
+    COUNTER = "counter"  # Value that only increases
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> 'MetricType':
+        """Get metric type from config."""
+        if 'type' not in config:
+            raise MetricConfigurationError("Dynamic metrics must specify a type")
+            
+        try:
+            return cls(config['type'].lower())
+        except ValueError:
+            raise MetricConfigurationError(
+                f"Invalid metric type: {config['type']}. "
+                f"Must be one of: {[t.value for t in cls]}"
+            )
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -965,7 +1017,8 @@ class MetricIdentifier:
     service: str
     group: str
     name: str
-    type: MetricType
+    group_type: MetricGroupType
+    type: Optional[MetricType] = None  # Optional because static metrics don't need a type
     description: str
 
     @property
@@ -1410,111 +1463,101 @@ class ServiceMetricsCollector:
                 self.logger.error(f"Failed to initialize user context for {service_name}: {e}")
     
     async def collect_metrics(self) -> Dict[MetricIdentifier, float]:
-            """Collect all metrics for this service."""
-            results = {}
-            self.logger.debug(f"Starting metrics collection for service: {self.service_name}")
+        """Collect all metrics for this service."""
+        results = {}
+        self.logger.debug(f"Starting metrics collection for service: {self.service_name}")
+        self.logger.debug(f"Service config: {self.service_config}")
+        
+        for group_name, group_config in self.service_config.get('metric_groups', {}).items():
+            group_type = MetricGroupType.from_config(group_config)
+            self.logger.debug(f"Processing metric group: {group_name} (type: {group_type.value})")
+            self.logger.debug(f"Group config: {group_config}")
             
-            for group_name, group_config in self.service_config.get('metric_groups', {}).items():
-                self.logger.debug(f"Processing metric group: {group_name}")
-                if not group_config.get('expose_metrics', True):
-                    self.logger.debug(f"Skipping unexposed group: {group_name}")
-                    continue
-
-                # First collect static metrics from this group
+            if group_type == MetricGroupType.STATIC:
+                self.logger.debug(f"Processing static metric group: {group_name}")
+                # Process static metrics directly from config
                 for metric_name, metric_config in group_config.get('metrics', {}).items():
                     try:
-                        metric_type = MetricType.from_config(metric_config)
-                        self.logger.debug(f"Processing metric {metric_name}, type: {metric_type}")
-                        
-                        if metric_type == MetricType.STATIC:
-                            self.logger.debug(f"Found static metric: {metric_name}")
-                            identifier = MetricIdentifier(
-                                service=self.service_name,
-                                group=group_name,
-                                name=metric_name,
-                                type=metric_type,
-                                description=metric_config.get('description', f'Metric {metric_name}')
-                            )
-                            value = float(metric_config.get('value', 0))
-                            results[identifier] = value
-                            self.logger.debug(f"Added static metric to results: {identifier.prometheus_name} = {value}")
+                        identifier = MetricIdentifier(
+                            service=self.service_name,
+                            group=group_name,
+                            name=metric_name,
+                            group_type=MetricGroupType.STATIC,
+                            description=metric_config['description']
+                        )
+                        results[identifier] = float(metric_config['value'])
+                        self.logger.debug(f"Added static metric: {identifier.prometheus_name} = {metric_config['value']}")
                     except Exception as e:
                         self.logger.error(f"Failed to process static metric {metric_name}: {e}")
-
-                # Then collect dynamic metrics
+            
+            else:  # DYNAMIC
+                self.logger.debug(f"Processing dynamic metric group: {group_name}")
                 try:
                     self.logger.debug(f"Collecting dynamic metrics for group: {group_name}")
                     group_metrics = await self.collect_group(group_name, group_config)
-                    self.logger.debug(f"Group {group_name} collection results: {group_metrics}")
                     results.update(group_metrics)
                 except Exception as e:
-                    self.logger.error(f"Failed to collect metric group {group_name}: {e}")
-            
-            self.logger.debug(f"Service {self.service_name} final collection results: {results}")
-            return results
+                    self.logger.error(f"Failed to collect dynamic metric group {group_name}: {e}")
+        
+        self.logger.debug(f"Service {self.service_name} final collection results: {results}")
+        return results
     
     async def collect_group(
         self,
         group_name: str,
         group_config: Dict
     ) -> Dict[MetricIdentifier, float]:
-        """Collect all non-static metrics in a group from a single source read."""
-        self.logger.debug(f"Starting collection for group {group_name}")
+        """Collect metrics for a dynamic group."""
+        self.logger.debug(f"Starting collection for dynamic group {group_name}")
+        results = {}
         
         try:
-            results = {}
-            command_output = None
+            # Execute command for dynamic metrics
+            command = group_config['command']
+            result = await self.command_executor.execute_command(command, self.user_context)
             
-            # Execute command if needed for non-static metrics
-            command = group_config.get('command')
-            if command:
-                result = await self.command_executor.execute_command(
-                    command,
-                    self.user_context
-                )
-                command_output = result.output if result.success else None
-                if command_output is None and result.error_message:
-                    self.logger.error(
-                        f"Command execution failed for group {group_name}: {result.error_message}"
-                    )
-                elif command_output is None:
-                    self.logger.debug(f"No source data for group {group_name}")
+            if not result.success:
+                self.logger.error(f"Command failed for group {group_name}: {result.error_message}")
+                # Handle error values if specified
+                for metric_name, metric_config in group_config.get('metrics', {}).items():
+                    if 'value_on_error' in metric_config:
+                        identifier = MetricIdentifier(
+                            service=self.service_name,
+                            group=group_name,
+                            name=metric_name,
+                            group_type=MetricGroupType.DYNAMIC,
+                            type=MetricType.from_config(metric_config),
+                            description=metric_config['description']
+                        )
+                        results[identifier] = float(metric_config['value_on_error'])
+                return results
 
-            # Process only non-static metrics
+            # Parse metrics from command output
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
                     metric_type = MetricType.from_config(metric_config)
-                    if metric_type == MetricType.STATIC:
-                        continue  # Skip static metrics, they're handled in collect_metrics
-
                     identifier = MetricIdentifier(
                         service=self.service_name,
                         group=group_name,
                         name=metric_name,
+                        group_type=MetricGroupType.DYNAMIC,
                         type=metric_type,
-                        description=metric_config.get('description', f'Metric {metric_name}')
+                        description=metric_config['description']
                     )
-
-                    if command_output is None:
-                        if 'value_on_error' in metric_config:
-                            value = float(metric_config['value_on_error'])
-                            self.logger.debug(
-                                f"Using error value {value} for metric {metric_name} "
-                                f"due to missing command output"
-                            )
-                            results[identifier] = value
-                        continue
-
-                    value = self._parse_metric_value(command_output, metric_config, metric_type)
+                    
+                    value = self._parse_metric_value(result.output, metric_config)
                     if value is not None:
                         results[identifier] = value
-                        self.logger.debug(f"Collected metric {metric_name} = {value}")
-
+                        self.logger.debug(f"Collected dynamic metric {metric_name} = {value}")
+                    elif 'value_on_error' in metric_config:
+                        results[identifier] = float(metric_config['value_on_error'])
+                        self.logger.debug(f"Using error value for {metric_name} = {metric_config['value_on_error']}")
+                        
                 except Exception as e:
-                    self.logger.error(f"Failed to parse metric {metric_name}: {e}")
-                    
+                    self.logger.error(f"Failed to collect dynamic metric {metric_name}: {e}")
+            
             return results
-                    
+            
         except Exception as e:
             self.logger.error(f"Failed to collect group {group_name}: {e}")
             return {}
@@ -1683,10 +1726,14 @@ class MetricsCollector:
         self,
         identifier: MetricIdentifier
     ) -> Union[Gauge, Counter]:
-        """Create appropriate Prometheus metric based on type."""
-        if identifier.type == MetricType.COUNTER:
+        """Create appropriate Prometheus metric based on identifier."""
+        if identifier.group_type == MetricGroupType.STATIC:
+            # Static metrics are always gauges
+            return Gauge(identifier.prometheus_name, identifier.description)
+        elif identifier.type == MetricType.COUNTER:
             return Counter(identifier.prometheus_name, identifier.description)
-        return Gauge(identifier.prometheus_name, identifier.description)
+        else:
+            return Gauge(identifier.prometheus_name, identifier.description)
 
     def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
         """Update Prometheus metrics with collected values."""
@@ -1694,7 +1741,9 @@ class MetricsCollector:
         
         self.logger.debug(f"Updating Prometheus metrics with {len(metrics)} metrics")
         for identifier, value in metrics.items():
-            self.logger.debug(f"Processing metric: {identifier.prometheus_name} ({identifier.type.value}) = {value}")
+            self.logger.debug(f"Processing metric: {identifier.prometheus_name} "
+                            f"(group_type={identifier.group_type.value}, "
+                            f"type={identifier.type.value if identifier.type else 'none'}) = {value}")
             
             # Always create the metric if it doesn't exist
             if identifier not in self._prometheus_metrics:
@@ -1705,15 +1754,18 @@ class MetricsCollector:
                 metric = self._prometheus_metrics[identifier]
                 self._last_collection_times[identifier] = self.config.now_utc()
                 
-                if identifier.type == MetricType.COUNTER:
+                if identifier.group_type == MetricGroupType.STATIC:
+                    metric.set(value)
+                    self.logger.debug(f"Set static metric {identifier.prometheus_name} to {value}")
+                elif identifier.type == MetricType.COUNTER:
                     prev_value = self._previous_values.get(identifier, 0)
                     if value > prev_value:
                         metric.inc(value - prev_value)
                     self._previous_values[identifier] = value
                     self.logger.debug(f"Updated counter {identifier.prometheus_name} to {value}")
-                else:  # Both GAUGE and STATIC get set directly
+                else:  # GAUGE
                     metric.set(value)
-                    self.logger.debug(f"Set {identifier.prometheus_name} to {value}")
+                    self.logger.debug(f"Set gauge {identifier.prometheus_name} to {value}")
 
                 # Update timestamp metric
                 timestamp_metric_name = f"{identifier.prometheus_name}_last_collected_unix_seconds"
@@ -1920,63 +1972,67 @@ class HealthCheck:
         return app
 
     def _get_metrics_inventory(self) -> Dict[str, Any]:
-            """Get metrics inventory with collection status."""
-            metrics_info = {}
-            last_collections = self.metrics_collector._last_collection_times
-            services_config = self.config.services  # Using validated config
+        """Get metrics inventory with collection status."""
+        metrics_info = {}
+        last_collections = self.metrics_collector._last_collection_times
+        services_config = self.config.services  # Using validated config
+        
+        for service_name, service_config in services_config.items():
+            service_info = {
+                "description": service_config.get("description", ""),
+                "run_as": service_config.get("run_as"),
+                "metric_groups": {}
+            }
             
-            for service_name, service_config in services_config.items():
-                service_info = {
-                    "description": service_config.get("description", ""),
-                    "run_as": service_config.get("run_as"),
-                    "metric_groups": {}
+            for group_name, group_config in service_config.get("metric_groups", {}).items():
+                group_type = MetricGroupType.from_config(group_config)
+                group_info = {
+                    "type": group_type.value,
+                    "command": group_config.get("command", "") if group_type == MetricGroupType.DYNAMIC else None,
+                    "metrics": {}
                 }
                 
-                for group_name, group_config in service_config.get("metric_groups", {}).items():
-                    group_info = {
-                        "command": group_config.get("command", ""),
-                        "metrics": {}
-                    }
+                for metric_name, metric_config in group_config.get("metrics", {}).items():
+                    identifier = MetricIdentifier(
+                        service=service_name,
+                        group=group_name,
+                        name=metric_name,
+                        group_type=group_type,
+                        type=(MetricType.from_config(metric_config) if group_type == MetricGroupType.DYNAMIC else None),
+                        description=metric_config.get("description", "")
+                    )
                     
-                    for metric_name, metric_config in group_config.get("metrics", {}).items():
-                        metric_type = MetricType.from_config(metric_config)
-                        identifier = MetricIdentifier(
-                            service=service_name,
-                            group=group_name,
-                            name=metric_name,
-                            type=metric_type,
-                            description=metric_config.get("description", "")
-                        )
+                    # Only include metrics that have been validated and are being collected
+                    if identifier in self.metrics_collector._prometheus_metrics:
+                        last_collection = last_collections.get(identifier)
+                        metric_info = {
+                            "type": (identifier.type.value if identifier.type else "static"),
+                            "description": metric_config.get("description", ""),
+                            "prometheus_name": identifier.prometheus_name,
+                            "last_collection_utc": (
+                                last_collection.isoformat() if last_collection else None
+                            ),
+                            "settings": {}
+                        }
                         
-                        # Only include metrics that have been validated and are being collected
-                        if identifier in self.metrics_collector._prometheus_metrics:
-                            last_collection = last_collections.get(identifier)
-                            metric_info = {
-                                "type": metric_type.value,
-                                "description": metric_config.get("description", ""),
-                                "prometheus_name": identifier.prometheus_name,
-                                "last_collection_utc": (
-                                    last_collection.isoformat() if last_collection else None
-                                ),
-                                "settings": {
-                                    "content_type": metric_config.get("content_type", "text"),
-                                    "filter": metric_config.get("filter"),
-                                    "value_on_error": metric_config.get("value_on_error")
-                                }
-                            }
-                            
-                            if metric_type == MetricType.STATIC:
-                                metric_info["settings"]["value"] = metric_config.get("value")
-                            
-                            group_info["metrics"][metric_name] = metric_info
-                    
-                    if group_info["metrics"]:  # Only include groups with valid metrics
-                        service_info["metric_groups"][group_name] = group_info
+                        if group_type == MetricGroupType.STATIC:
+                            metric_info["settings"]["value"] = metric_config.get("value")
+                        else:
+                            metric_info["settings"].update({
+                                "content_type": metric_config.get("content_type", "text"),
+                                "filter": metric_config.get("filter"),
+                                "value_on_error": metric_config.get("value_on_error")
+                            })
+                        
+                        group_info["metrics"][metric_name] = metric_info
                 
-                if service_info["metric_groups"]:  # Only include services with valid groups
-                    metrics_info[service_name] = service_info
+                if group_info["metrics"]:  # Only include groups with valid metrics
+                    service_info["metric_groups"][group_name] = group_info
             
-            return metrics_info
+            if service_info["metric_groups"]:  # Only include services with valid groups
+                metrics_info[service_name] = service_info
+        
+        return metrics_info
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Main Service Class and Entry Point
