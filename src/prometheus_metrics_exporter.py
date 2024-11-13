@@ -148,47 +148,6 @@ from cysystemd import journal
 import yaml
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
-# Verbose Logging for Development
-#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
-
-VERBOSE_DEBUG = False
-VERBOSE_LEVEL = 15  # DEBUG 10, INFO 20
-logging.addLevelName(VERBOSE_LEVEL, 'VERBOSE')
-
-class VerboseLogger(logging.Logger):
-    """Enhanced Logger class adding development-only verbose debugging capabilities
-    
-        This logger subclass adds a verbose() method for development debugging that:
-        1. Has zero runtime impact when VERBOSE_DEBUG = False
-        2. Supports both simple strings and deferred evaluation of expensive computations
-        3. Requires no configuration or runtime overhead
-        4. Works seamlessly with existing logger methods
-    """
-    def verbose(
-        self,
-        msg: Union[str, Callable[[], str]],
-        *args: Any,
-        **kwargs: Any
-    ) -> None:
-        """Log verbose debug messages with efficient deferred evaluation."""
-        global VERBOSE_DEBUG
-        if not VERBOSE_DEBUG:
-            return
-
-        # Handle deferred evaluation of expensive computations
-        if callable(msg):
-            if args or kwargs:
-                self.log(VERBOSE_LEVEL, msg(*args, **kwargs))
-            else:
-                self.log(VERBOSE_LEVEL, msg())
-        # Handle string formatting
-        elif args or kwargs:
-            self.log(VERBOSE_LEVEL, msg.format(*args, **kwargs))
-        # Handle simple strings
-        else:
-            self.log(VERBOSE_LEVEL, msg)
-
-#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Core Exceptions
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -431,18 +390,22 @@ class ProgramConfig:
 
     def _validate_exporter_section(self, config: Dict[str, Any]) -> None:
         """Basic validation of exporter configuration."""
-        # Validate ports
-        metrics_port = config.get('metrics_port', self.DEFAULT_METRICS_PORT)
-        health_port = config.get('health_port', self.DEFAULT_HEALTH_PORT)
-        
-        if not isinstance(metrics_port, int) or metrics_port < 1 or metrics_port > 65535:
-            raise MetricConfigurationError(f"Invalid metrics_port {metrics_port}")
-            
-        if not isinstance(health_port, int) or health_port < 1 or health_port > 65535:
-            raise MetricConfigurationError(f"Invalid health_port {health_port}")
-            
-        if metrics_port == health_port:
-            raise MetricConfigurationError("metrics_port and health_port must be different")
+        if not config:
+            return
+
+        if 'metrics_port' in config:
+            metrics_port = config['metrics_port']
+            if not isinstance(metrics_port, int) or metrics_port < 1 or metrics_port > 65535:
+                raise MetricConfigurationError(f"Invalid metrics_port {metrics_port}")
+                
+        if 'health_port' in config:
+            health_port = config['health_port']
+            if not isinstance(health_port, int) or health_port < 1 or health_port > 65535:
+                raise MetricConfigurationError(f"Invalid health_port {health_port}")
+                
+            if 'metrics_port' in config and metrics_port == health_port:
+                raise MetricConfigurationError("metrics_port and health_port must be different")
+
 
     def _validate_services(self, services_config: Dict[str, Any]) -> Dict[str, Any]:
         """Validate services section with optimistic parsing."""
@@ -792,6 +755,37 @@ class ProgramConfig:
 class ProgramLogger:
     """Manages logging configuration and setup."""
     
+    # Verbose logging config
+    VERBOSE_DEBUG = False
+    VERBOSE_LEVEL = 15  # DEBUG 10, INFO 20
+
+    class VerboseLogger(logging.Logger):
+        """Enhanced Logger class adding verbose debugging capabilities"""
+
+        def verbose(
+            self,
+            msg: Union[str, Callable[[], str]],
+            *args: Any,
+            **kwargs: Any
+        ) -> None:
+            """Log verbose debug messages with efficient deferred evaluation."""
+
+            if not ProgramLogger.VERBOSE_DEBUG:
+                return
+
+            # Handle deferred evaluation of expensive computations
+            if callable(msg):
+                if args or kwargs:
+                    self.log(ProgramLogger.VERBOSE_LEVEL, msg(*args, **kwargs))
+                else:
+                    self.log(ProgramLogger.VERBOSE_LEVEL, msg())
+            # Handle string formatting
+            elif args or kwargs:
+                self.log(ProgramLogger.VERBOSE_LEVEL, msg.format(*args, **kwargs))
+            # Handle simple strings
+            else:
+                self.log(ProgramLogger.VERBOSE_LEVEL, msg)
+
     def __init__(
         self,
         source: ProgramSource,
@@ -805,7 +799,8 @@ class ProgramLogger:
         """
 
         # Set VerboseLogger as the default logger class
-        logging.setLoggerClass(VerboseLogger)
+        logging.addLevelName(self.VERBOSE_LEVEL, 'VERBOSE')
+        logging.setLoggerClass(self.VerboseLogger)
 
         self.source = source
         self.config = config
@@ -912,11 +907,8 @@ class ProgramLogger:
         logger.handlers.clear()
 
         log_settings = self._get_logging_config()
-
-        # Set base logger level
         logger.setLevel(log_settings['level'])
         
-        # Create formatter
         formatter = logging.Formatter(
             log_settings['format'],
             log_settings['date_format']

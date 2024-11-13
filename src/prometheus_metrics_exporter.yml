@@ -77,7 +77,7 @@ exporter:
     collection:
         poll_interval_sec: 5 # Global polling interval, override with collection_frequency (template, service, metric_group)
     logging:
-        level: "DEBUG"
+        console_level: "DEBUG"
 
 # Services Configuration (required)
 services:
