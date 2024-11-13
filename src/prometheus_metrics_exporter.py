@@ -1628,7 +1628,9 @@ class MetricsExporter:
         OSError: If required ports are unavailable
         Exception: For other initialization failures
     """
-    
+
+    SHUTDOWN_TIMEOUT = 30  # seconds
+
     def __init__(
         self,
         source: ProgramSource,
@@ -1645,7 +1647,8 @@ class MetricsExporter:
         self.source = source
         self.config = config
         self.logger = logger
-        self.shutdown_event = threading.Event()
+        self.shutdown_event = asyncio.Event()
+        self.shutdown_complete = asyncio.Event()
         self._servers_started = False
         
         self.logger.info("Starting metrics exporter initialization")
@@ -1683,14 +1686,10 @@ class MetricsExporter:
         signal_name = signal.Signals(signum).name
         self.logger.info(f"Received {signal_name}, initiating shutdown...")
         try:
-            # Ensure cleanup happens before notification
-            self._cleanup()
-            if self.config.running_under_systemd:
-                notify(Notification.STOPPING)
+            self.logger.debug("Cleanup completed, setting shutdown event")
+            asyncio.get_event_loop().call_soon_threadsafe(self.shutdown_event.set)
         except Exception as e:
             self.logger.error(f"Error during signal cleanup: {e}")
-        finally:
-            self.shutdown_event.set()
 
     def check_ports(self) -> bool:
         """Check if required ports are available."""
@@ -1749,8 +1748,8 @@ class MetricsExporter:
             self.logger.error(f"Unexpected error starting servers: {e}")
             return False
 
-    def _cleanup(self):
-        """Clean up resources on shutdown."""
+    async def _cleanup_async(self):
+        """Asynchronous cleanup of resources."""
         if not self._servers_started:
             return
         
@@ -1763,10 +1762,14 @@ class MetricsExporter:
             # Stop metrics server (no direct way with prometheus_client)
             self.logger.info("Metrics server will stop with process termination")
 
+            if self.config.running_under_systemd:
+                notify(Notification.STOPPING)
+
         except Exception as e:
             self.logger.error(f"Error during cleanup: {e}")
         finally:
             self._servers_started = False
+            self.shutdown_complete.set()
 
     async def run(self):
         """Main service loop."""
@@ -1788,37 +1791,50 @@ class MetricsExporter:
             if self.config.running_under_systemd:
                 notify(Notification.READY)
             
-            # Main collection loop
-            while not self.shutdown_event.is_set():
-                try:
-                    loop_start = self.config.now_utc().timestamp()
-                    await self.metrics_collector.collect_all_metrics()
-                    
-                    elapsed = self.config.now_utc().timestamp() - loop_start
-                    sleep_time = max(0, self.config.poll_interval - elapsed)
-                    
-                    if sleep_time > 0:
-                        # Use wait_for to handle shutdown during sleep
-                        try:
-                            await asyncio.wait_for(
-                                self.shutdown_event.wait(),
-                                timeout=sleep_time
+            # Main collection loop with shutdown timeout
+            try:
+                while not self.shutdown_event.is_set():
+                    try:
+                        loop_start = self.config.now_utc().timestamp()
+                        await self.metrics_collector.collect_all_metrics()
+                        
+                        elapsed = self.config.now_utc().timestamp() - loop_start
+                        sleep_time = max(0, self.config.poll_interval - elapsed)
+                        
+                        if sleep_time > 0:
+                            try:
+                                # Wait for shutdown event or timeout
+                                await asyncio.wait_for(self.shutdown_event.wait(), timeout=sleep_time)
+                            except asyncio.TimeoutError:
+                                continue  # Normal timeout, continue collection
+                        else:
+                            self.logger.warning(
+                                f"Collection took longer than poll interval "
+                                f"({elapsed:.2f}s > {self.config.poll_interval}s)"
                             )
-                            break  # Exit loop if shutdown event is set
-                        except asyncio.TimeoutError:
-                            pass  # Normal timeout, continue collection
-                    else:
-                        self.logger.warning(
-                            f"Collection took longer than poll interval "
-                            f"({elapsed:.2f}s > {self.config.poll_interval}s)"
-                        )
-                    
-                except Exception as e:
-                    self.logger.error(f"Error in main loop: {e}")
-                    self.logger.debug("Exception details:", exc_info=True)
-                    await asyncio.sleep(1)  # Avoid tight loop on persistent errors
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error in main loop: {e}")
+                        self.logger.debug("Exception details:", exc_info=True)
+                        await asyncio.sleep(1)  # Avoid tight loop on persistent errors
             
-            self.logger.info("Shutdown event received, stopping service")
+                self.logger.info("Shutdown event received, stopping service")
+
+                # Start cleanup and wait with timeout
+                cleanup_task = asyncio.create_task(self._cleanup_async())
+                try:
+                    await asyncio.wait_for(self.shutdown_complete.wait(), timeout=self.SHUTDOWN_TIMEOUT)
+                    self.logger.info("Cleanup completed successfully")
+                except asyncio.TimeoutError:
+                    self.logger.error(f"Cleanup timed out after {self.SHUTDOWN_TIMEOUT} seconds")
+                    if self.config.running_under_systemd:
+                        notify(Notification.STOPPING)
+                    return 1
+
+            except asyncio.CancelledError:
+                self.logger.warning("Service operation cancelled")
+                raise
+
             return 0
             
         except Exception as e:
@@ -1826,13 +1842,16 @@ class MetricsExporter:
             return 1
 
         finally:
-            # Ensure cleanup and notification happen
-            try:
-                self._cleanup()
-                if self.config.running_under_systemd:
-                    notify(Notification.STOPPING)
-            except Exception as e:
-                self.logger.error(f"Error during shutdown cleanup: {e}")
+            # Final cleanup attempt if timeout occurred
+            if not self.shutdown_complete.is_set():
+                self.logger.warning("Forcing final cleanup")
+                try:
+                    await self._cleanup_async()
+                except Exception as e:
+                    self.logger.error(f"Error during final cleanup: {e}")
+            
+            if self.config.running_under_systemd:
+                notify(Notification.STOPPING)
             self.logger.info("Service shutdown complete")
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
@@ -1853,8 +1872,7 @@ async def main():
             logger.info("Received keyboard interrupt, shutting down...")
             if exporter:
                 # Call cleanup method before exiting
-                exporter._cleanup()
-                # If running under systemd, notify stopping
+                await exporter._cleanup_async()
                 if exporter.config.running_under_systemd:
                     notify(Notification.STOPPING)
             return 0
@@ -1862,7 +1880,7 @@ async def main():
         except Exception as e:
             logger.error(f"Failed to start metrics exporter: {e}")
             if exporter:
-                exporter._cleanup()
+                await exporter._cleanup_async()
                 if exporter.config.running_under_systemd:
                     notify(Notification.STOPPING)
             return 1
@@ -1871,7 +1889,7 @@ async def main():
         # Only use print for catastrophic failures in logger setup
         print(f"Fatal error during startup: {e}", file=sys.stderr)
         if exporter:
-            exporter._cleanup()
+            await exporter._cleanup_async()
         return 1
 
 if __name__ == '__main__':
