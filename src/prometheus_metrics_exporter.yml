@@ -72,33 +72,123 @@
 
 # Exporter Configuration (optional)
 exporter:
-    metrics_port: 9101
-    health_port: 9102
-    collection:
-        poll_interval_sec: 5 # Global polling interval, override with collection_frequency (template, service, metric_group)
-    logging:
-        console_level: "DEBUG"
+   metrics_port: 9101
+   health_port: 9102
+   collection:
+       poll_interval_sec: 5  # Global polling interval
+   logging:
+       console_level: "DEBUG"
 
 # Services Configuration (required)
 services:
-    algorand_node:
-        description: "Algorand node services"
-        run_as: algorand
-        metric_groups:
-            status:
-                command: "/usr/bin/goal node status -d /var/lib/algorand"
-                metrics:
-                    sync_time:
-                        type: "gauge"
-                        description: "Node synchronization time in seconds"
-                        filter: "Sync Time: ([0-9.]+)s"
-                        labels:
-                            genesis_id:
-                                filter: "Genesis ID: ([\\w-\\.]+)"
-            data_store:
-                command: "du -sb /var/lib/algorand"
-                metrics:
-                    bytes:
-                        type: "gauge"
-                        description: "Algorand data storage directory size"
-                        filter: "^(\\d+)"
+   algorand_node:
+       description: "Algorand node services"
+       run_as: algorand
+       metric_groups:
+           node_status:
+               command: "/usr/bin/goal node status -d /var/lib/algorand"
+               description: "Algorand node status metrics"
+               # Group level labels identify this node instance
+               labels:
+                   genesis_id:
+                       filter: "Genesis ID: (.+)$"
+                   genesis_hash: 
+                       filter: "Genesis hash: (.+)$"
+                   last_catchpoint:
+                       filter: "Last Catchpoint: (.+)$"
+               metrics:
+                   sync_time_seconds:
+                       type: "gauge"
+                       description: "Node synchronization time in seconds"
+                       filter: "Sync Time: ([0-9.]+)s"
+                   
+                   last_block_age_seconds:
+                       type: "gauge" 
+                       description: "Time since last block in seconds"
+                       filter: "Time since last block: ([0-9.]+)s"
+                   
+                   last_committed_round:
+                       type: "gauge"
+                       description: "Last committed round number"
+                       filter: "Last committed block: ([0-9]+)"
+                   
+                   next_consensus_round:
+                       type: "gauge"
+                       description: "Round number for next consensus protocol"
+                       filter: "Round for next consensus protocol: ([0-9]+)"
+                   
+                   consensus_upgrade_ready:
+                       type: "gauge"
+                       description: "Whether next consensus protocol is supported (1=true, 0=false)"
+                       filter: "Next consensus protocol supported: (true|false)"
+                       transform: "value.lower() == 'true' and 1 or 0"
+                       labels:
+                           next_protocol:
+                               filter: "Next consensus protocol: (.+)$"
+                           current_protocol:
+                               filter: "Last consensus protocol: (.+)$"
+
+           process_stats:
+               command: "systemctl show algorand.service -p MainPID -p TasksCurrent -p TasksMax -p MemoryCurrent -p CPUUsageNSec -p ActiveState -p SubState -p ExecMainStartTimestamp -p ExecStart"
+               description: "Algorand process metrics from systemd"
+               labels:
+                   active_state:
+                       filter: "^ActiveState=(.+)$"
+                   sub_state:
+                       filter: "^SubState=(.+)$"
+                   data_dir:
+                       filter: "ExecStart=.*-d ([^ ]+)"
+               metrics:
+                   pid:
+                       type: "gauge"
+                       description: "Main process ID of algod"
+                       filter: "^MainPID=([0-9]+)$"
+                   
+                   tasks_current:
+                       type: "gauge"
+                       description: "Current number of tasks"
+                       filter: "^TasksCurrent=([0-9]+)$"
+                   
+                   tasks_max:
+                       type: "gauge"
+                       description: "Maximum allowed tasks"
+                       filter: "^TasksMax=([0-9]+)$"
+                   
+                   memory_bytes:
+                       type: "gauge"
+                       description: "Current memory usage in bytes"
+                       filter: "^MemoryCurrent=([0-9]+)$"
+                   
+                   cpu_seconds_total:
+                       type: "counter"
+                       description: "Total CPU time consumed in seconds"
+                       filter: "^CPUUsageNSec=([0-9]+)$"
+                       transform: "unix_nano_to_sec(value)"
+                   
+                   uptime_seconds:
+                       type: "gauge"
+                       description: "Process uptime in seconds"
+                       filter: "^ExecMainStartTimestamp=([0-9]+)$"
+                       transform: "now - unix_micro_to_sec(value)"
+
+           api_health:
+               command: "curl -so /dev/null -w '%{http_code}' http://localhost:8080/health"
+               description: "Algorand API health check"
+               metrics:
+                   up:
+                       type: "gauge"
+                       description: "Whether the API health check succeeded (1=healthy, 0=unhealthy)"
+                       filter: "^([0-9]+)$"
+                       transform: "value == 200 and 1 or 0"
+
+           data_store:
+               command: "du -sb /var/lib/algorand"
+               description: "Algorand data directory size"
+               labels:
+                   data_dir:
+                       filter: "^[0-9]+\\s+(.+)$"
+               metrics:
+                   bytes_total:
+                       type: "gauge"
+                       description: "Total size of algorand data directory in bytes"
+                       filter: "^([0-9]+)"

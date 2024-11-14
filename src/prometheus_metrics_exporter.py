@@ -62,6 +62,13 @@ services:
                         content_type: "text|json"  # How to parse output, default text
                         value: 1.0  # Required for static metrics only
 
+    transform: "transform expression"  # Optional transform for parsed value
+        - Basic math: value * 1000, value / 2
+        - Conditionals: value == 200 and 1 or 0
+        - Time helpers: unix_nano_to_sec(value), unix_micro_to_sec(value)
+        - Time formats: to_timestamp(value, SYSTEMD), now - timestamp
+                        
+
 Health Check API:
 ---------------------
 GET /health
@@ -546,6 +553,12 @@ class ProgramConfig:
                                 f"in metric '{metric_name}' label '{label_name}': {label_config['filter']}"
                             )
         
+                # Check transforms
+                if 'transform' in metric_config:
+                    if not isinstance(metric_config['transform'], str) or not metric_config['transform'].strip():
+                        raise MetricConfigurationError("Transform must be a non-empty string")
+                    validated_metric['transform'] = metric_config['transform']
+
         # Process static metrics
         if group_type == MetricGroupType.STATIC:
             metrics_count = len(group_config.get('metrics', {}))
@@ -874,7 +887,7 @@ class ProgramLogger:
             *args: Any,
             **kwargs: Any
         ) -> None:
-            """Log verbose debug messages with caller context."""
+            """Log verbose debug messages."""
             if not VERBOSE_DEBUG:
                 return
 
@@ -887,26 +900,25 @@ class ProgramLogger:
                     function_name = caller_frame.f_code.co_name
                     line_no = caller_frame.f_lineno
                     
-                    # Format caller context with line number
-                    kwargs['extra'] = {
-                        'name': f"{module_name}.{function_name}({line_no:d})"
-                    }
+                    # Add context to message instead of trying to modify LogRecord
+                    context = f"[{module_name}.{function_name}:{line_no}] "
                     
                     # Handle message
                     if callable(msg):
-                        self.log(ProgramLogger.VERBOSE_LEVEL,
-                                msg(*args) if args else msg(), 
-                                **kwargs)
+                        final_msg = msg(*args) if args else msg()
                     else:
-                        self.log(ProgramLogger.VERBOSE_LEVEL,
-                                msg.format(*args) if args else msg, 
-                                **kwargs)
+                        final_msg = msg.format(*args) if args else msg
                         
+                    self.log(ProgramLogger.VERBOSE_LEVEL, context + str(final_msg), **kwargs)
+                    
             except Exception as e:
                 # Fallback to basic logging if context extraction fails
                 self.warning(f"Failed to get caller context: {e}")
-                super().verbose(msg, *args, **kwargs)
-                
+                if callable(msg):
+                    self.log(ProgramLogger.VERBOSE_LEVEL, msg(*args) if args else msg(), **kwargs)
+                else:
+                    self.log(ProgramLogger.VERBOSE_LEVEL, msg, *args, **kwargs)
+                    
             finally:
                 # Clean up frame references
                 if frame:
@@ -1225,18 +1237,23 @@ class ContentType(Enum):
     TEXT = "text" # Use regex pattern matching
     JSON = "json" # Use jq-style path filtering
     
-    def validate_filter(self, filter_expr: str) -> bool:
+    def validate_filter(self, filter_expr: str, logger: Optional[logging.Logger] = None) -> bool:
         """Validate filter expression matches content type."""
-        if self == ContentType.TEXT:
-            try:
+        try:
+            if self == ContentType.TEXT:
+                if logger:
+                    logger.debug(f"Validating TEXT filter: {filter_expr}")
                 re.compile(filter_expr)
                 return True
-            except re.error:
-                return False
-        elif self == ContentType.JSON:
-            # jq-style path should be dot-separated keys
-            return bool(re.match(r'^\.?[\w]+(\.[\w]+)*$', filter_expr))
-        return False
+            elif self == ContentType.JSON:
+                if logger:
+                    logger.debug(f"Validating JSON filter: {filter_expr}")
+                # jq-style path should be dot-separated keys
+                return bool(re.match(r'^\.?[\w]+(\.[\w]+)*$', filter_expr))
+        except Exception as e:
+            if logger:
+                logger.warning(f"Filter validation failed: {e}")
+            return False
 
     def parse_value(self, content: str, filter_expr: str, logger: logging.Logger, convert_to_float: bool = True) -> Optional[Union[float, str]]:
         """Parse content based on content type."""
@@ -1865,47 +1882,79 @@ class ServiceMetricsCollector:
             self.logger.error(f"Failed to collect group {group_name}: {e}")
             return {}
     
+    # Modify _parse_metric_value:
     def _parse_metric_value(
-            self,
-            source_data: str,
-            metric_config: Dict,
-            metric_type: MetricType
-        ) -> Optional[float]:
-            """Parse individual metric value from group's source data."""
-            try:
-                if source_data is None:
-                    self.logger.verbose("No source data available")
-                    return None
-                
-                if 'filter' not in metric_config:
-                    self.logger.error(f"{metric_type.value} metric must specify a filter")
-                    return None
+        self,
+        source_data: str,
+        metric_config: Dict,
+        metric_type: MetricType
+    ) -> Optional[float]:
+        """Parse individual metric value from group's source data."""
+        try:
+            if source_data is None:
+                self.logger.verbose("No source data available")
+                return None
+            
+            if 'filter' not in metric_config:
+                self.logger.error(f"{metric_type.value} metric must specify a filter")
+                return None
 
-                content_type = metric_config.get('content_type', 'text')
-                try:
-                    content_type_enum = ContentType(content_type)
-                    value = content_type_enum.parse_value(
-                        source_data,
-                        metric_config['filter'],
-                        self.logger
-                    )
-                    if value is None:
-                        raise MetricValidationError("Parser returned None value")
-                    return float(value)  # Final validation that value is numeric
+            content_type = metric_config.get('content_type', 'text')
+            try:
+                content_type_enum = ContentType(content_type)
+                raw_value = content_type_enum.parse_value(
+                    source_data,
+                    metric_config['filter'],
+                    self.logger
+                )
+                if raw_value is None:
+                    raise MetricValidationError("Parser returned None value")
                     
-                except (TypeError, ValueError, MetricValidationError) as e:
-                    self.logger.warning(
-                        f"Failed to validate metric value: {e}. "
-                        f"Skipping this metric but continuing collection."
-                    )
-                    return None
-                    
-            except Exception as e:
+                # Apply transform if specified
+                if 'transform' in metric_config:
+                    transform = metric_config['transform']
+                    self.logger.verbose(f"Applying transform: {transform}")
+                    try:
+                        # Convert raw value to appropriate type
+                        value = float(raw_value) if str(raw_value).isdigit() else str(raw_value)
+                        
+                        # Safe evaluation environment
+                        now = datetime.now(timezone.utc).timestamp()
+                        env = {
+                            'value': value,
+                            'true': 1,
+                            'false': 0,
+                            'now': now,
+                            'to_timestamp': lambda dt_str, fmt: datetime.strptime(dt_str, fmt).replace(tzinfo=timezone.utc).timestamp(),
+                            'unix_micro_to_sec': lambda ts: ts / 1_000_000,
+                            'unix_nano_to_sec': lambda ts: ts / 1_000_000_000,
+                            'unix_milli_to_sec': lambda ts: ts / 1_000,
+                            'RFC3339': '%Y-%m-%dT%H:%M:%S.%fZ',
+                            'ISO8601': '%Y-%m-%dT%H:%M:%S%z',
+                            'SYSTEMD': '%a %Y-%m-%d %H:%M:%S UTC',
+                        }
+                        result = eval(transform, {'__builtins__': {}}, env)
+                        self.logger.verbose(f"Transform result: {result}")
+                        return float(result)
+                    except Exception as e:
+                        self.logger.error(f"Transform failed: {e}")
+                        return None
+
+                return float(raw_value)  # Final validation that value is numeric
+                
+            except (TypeError, ValueError, MetricValidationError) as e:
                 self.logger.warning(
-                    f"Unexpected error parsing metric value: {e}. "
+                    f"Failed to validate metric value: {e}. "
                     f"Skipping this metric but continuing collection."
                 )
                 return None
+                
+        except Exception as e:
+            self.logger.warning(
+                f"Unexpected error parsing metric value: {e}. "
+                f"Skipping this metric but continuing collection."
+            )
+            return None
 
     def _extract_label_values(
         self,
