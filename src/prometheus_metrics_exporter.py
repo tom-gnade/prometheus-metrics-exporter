@@ -1993,20 +1993,20 @@ class ServiceMetricsCollector:
                         transform = metric_config['transform']
                         self.logger.verbose(f"Applying transform: {transform}")
                         try:
-                            # Convert raw value to appropriate type
-                            # Keep original string value and provide numeric conversions in env
-                            value = str(raw_value)
-                            
                             # Safe evaluation environment with type conversion functions
                             now = datetime.now(timezone.utc).timestamp()
-                            env = {
-                                'value': value,
+                            
+                            # Move env out of the nested scope and include all functions
+                            transform_env = {
+                                '__builtins__': {
+                                    'int': int,
+                                    'float': float,
+                                    'str': str
+                                },
+                                'value': str(raw_value),
                                 'true': 1,
                                 'false': 0,
                                 'now': now,
-                                'int': int,
-                                'float': float,
-                                'str': str,
                                 'to_timestamp': lambda dt_str, fmt: datetime.strptime(dt_str, fmt).replace(tzinfo=timezone.utc).timestamp(),
                                 'unix_micro_to_sec': lambda ts: float(ts) / 1_000_000,
                                 'unix_nano_to_sec': lambda ts: float(ts) / 1_000_000_000,
@@ -2015,7 +2015,8 @@ class ServiceMetricsCollector:
                                 'ISO8601': '%Y-%m-%dT%H:%M:%S%z',
                                 'SYSTEMD': '%a %Y-%m-%d %H:%M:%S UTC',
                             }
-                            result = eval(transform, {'__builtins__': {}}, env)
+                            
+                            result = eval(transform, transform_env)
                             self.logger.verbose(f"Transform result: {result}")
                             return float(result)
                         except Exception as e:
