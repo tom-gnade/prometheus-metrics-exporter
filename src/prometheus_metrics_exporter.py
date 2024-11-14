@@ -1754,7 +1754,8 @@ class ServiceMetricsCollector:
             group_labels = []
             if 'labels' in group_config:
                 self.logger.verbose("\n=== Processing group-level labels ===")
-                self.logger.verbose(f"Group label config: {json.dumps(group_config['labels'], indent=2)}")
+                self.logger.verbose(f"Full group config: {json.dumps(group_config, indent=2)}")
+                self.logger.verbose(f"Group labels config: {json.dumps(group_config['labels'], indent=2)}")
                 extracted_labels = self._extract_label_values(
                     group_config['labels'],
                     output,
@@ -1854,9 +1855,9 @@ class ServiceMetricsCollector:
 
                         # Combine group and metric labels
                         combined_labels = []
-                        combined_labels.extend(group_labels)
-                        combined_labels.extend(metric_labels)
-                        self.logger.verbose(f"Combined labels for {metric_name}: {combined_labels}")
+                        combined_labels.extend(group_labels)  # Start with group labels
+                        combined_labels.extend(metric_labels) # Add metric labels
+                        self.logger.verbose(f"Final combined labels for {metric_name}: {combined_labels}")
 
                         # Create identifier with all labels
                         identifier = MetricIdentifier(
