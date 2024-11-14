@@ -156,10 +156,10 @@ services:
                         filter: "(?m)^CPUUsageNSec[=:] *([0-9]+)$"
                         transform: "unix_nano_to_sec(value)"
                     uptime_seconds:
-                        type: "gauge"
+                        type: "gauge" 
                         description: "Process uptime in seconds"
                         filter: "(?m)^ExecMainStartTimestamp=(.+)$"
-                        transform: "now - to_timestamp(value, '%a %Y-%m-%d %H:%M:%S %Z')"
+                        transform: "now - to_timestamp(value, SYSTEMD)"
             api_health:
                 command: "curl -so /dev/null -w '%{http_code}' http://localhost:8080/health"
                 description: "Algorand API health check"
@@ -168,7 +168,7 @@ services:
                         type: "gauge"
                         description: "Whether the API health check succeeded (1=healthy, 0=unhealthy)"
                         filter: "^([0-9]+)$"
-                        transform: "int(value) == 200 and 1 or 0"
+                        transform: "int(value) == 200 and 1 or 0" 
             data_store:
                 command: "du -sb /var/lib/algorand"
                 description: "Algorand data directory size"

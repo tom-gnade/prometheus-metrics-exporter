@@ -1960,79 +1960,83 @@ class ServiceMetricsCollector:
             self.logger.error(f"Failed to collect metric group {group_name}: {str(e)}")
             return {}
     
-    # Modify _parse_metric_value:
+        # Modify _parse_metric_value:
     def _parse_metric_value(
-        self,
-        source_data: str,
-        metric_config: Dict,
-        metric_type: MetricType
-    ) -> Optional[float]:
-        """Parse individual metric value from group's source data."""
-        try:
-            if source_data is None:
-                self.logger.verbose("No source data available")
-                return None
-            
-            if 'filter' not in metric_config:
-                self.logger.error(f"{metric_type.value} metric must specify a filter")
-                return None
-
-            content_type = metric_config.get('content_type', 'text')
+            self,
+            source_data: str,
+            metric_config: Dict,
+            metric_type: MetricType
+        ) -> Optional[float]:
+            """Parse individual metric value from group's source data."""
             try:
-                content_type_enum = ContentType(content_type)
-                raw_value = content_type_enum.parse_value(
-                    source_data,
-                    metric_config['filter'],
-                    self.logger
-                )
-                if raw_value is None:
-                    raise MetricValidationError("Parser returned None value")
-                    
-                # Apply transform if specified
-                if 'transform' in metric_config:
-                    transform = metric_config['transform']
-                    self.logger.verbose(f"Applying transform: {transform}")
-                    try:
-                        # Convert raw value to appropriate type
-                        value = float(raw_value) if str(raw_value).isdigit() else str(raw_value)
-                        
-                        # Safe evaluation environment
-                        now = datetime.now(timezone.utc).timestamp()
-                        env = {
-                            'value': value,
-                            'true': 1,
-                            'false': 0,
-                            'now': now,
-                            'to_timestamp': lambda dt_str, fmt: datetime.strptime(dt_str, fmt).replace(tzinfo=timezone.utc).timestamp(),
-                            'unix_micro_to_sec': lambda ts: ts / 1_000_000,
-                            'unix_nano_to_sec': lambda ts: ts / 1_000_000_000,
-                            'unix_milli_to_sec': lambda ts: ts / 1_000,
-                            'RFC3339': '%Y-%m-%dT%H:%M:%S.%fZ',
-                            'ISO8601': '%Y-%m-%dT%H:%M:%S%z',
-                            'SYSTEMD': '%a %Y-%m-%d %H:%M:%S UTC',
-                        }
-                        result = eval(transform, {'__builtins__': {}}, env)
-                        self.logger.verbose(f"Transform result: {result}")
-                        return float(result)
-                    except Exception as e:
-                        self.logger.error(f"Transform failed: {e}")
-                        return None
-
-                return float(raw_value)  # Final validation that value is numeric
+                if source_data is None:
+                    self.logger.verbose("No source data available")
+                    return None
                 
-            except (TypeError, ValueError, MetricValidationError) as e:
+                if 'filter' not in metric_config:
+                    self.logger.error(f"{metric_type.value} metric must specify a filter")
+                    return None
+
+                content_type = metric_config.get('content_type', 'text')
+                try:
+                    content_type_enum = ContentType(content_type)
+                    raw_value = content_type_enum.parse_value(
+                        source_data,
+                        metric_config['filter'],
+                        self.logger
+                    )
+                    if raw_value is None:
+                        raise MetricValidationError("Parser returned None value")
+                        
+                    # Apply transform if specified
+                    if 'transform' in metric_config:
+                        transform = metric_config['transform']
+                        self.logger.verbose(f"Applying transform: {transform}")
+                        try:
+                            # Convert raw value to appropriate type
+                            # Keep original string value and provide numeric conversions in env
+                            value = str(raw_value)
+                            
+                            # Safe evaluation environment with type conversion functions
+                            now = datetime.now(timezone.utc).timestamp()
+                            env = {
+                                'value': value,
+                                'true': 1,
+                                'false': 0,
+                                'now': now,
+                                'int': int,
+                                'float': float,
+                                'str': str,
+                                'to_timestamp': lambda dt_str, fmt: datetime.strptime(dt_str, fmt).replace(tzinfo=timezone.utc).timestamp(),
+                                'unix_micro_to_sec': lambda ts: float(ts) / 1_000_000,
+                                'unix_nano_to_sec': lambda ts: float(ts) / 1_000_000_000,
+                                'unix_milli_to_sec': lambda ts: float(ts) / 1_000,
+                                'RFC3339': '%Y-%m-%dT%H:%M:%S.%fZ',
+                                'ISO8601': '%Y-%m-%dT%H:%M:%S%z',
+                                'SYSTEMD': '%a %Y-%m-%d %H:%M:%S UTC',
+                            }
+                            result = eval(transform, {'__builtins__': {}}, env)
+                            self.logger.verbose(f"Transform result: {result}")
+                            return float(result)
+                        except Exception as e:
+                            self.logger.error(f"Transform failed: {e}")
+                            return None
+
+                    return float(raw_value)  # Final validation that value is numeric
+                    
+                except (TypeError, ValueError, MetricValidationError) as e:
+                    self.logger.warning(
+                        f"Failed to validate metric value: {e}. "
+                        f"Skipping this metric but continuing collection."
+                    )
+                    return None
+                    
+            except Exception as e:
                 self.logger.warning(
-                    f"Failed to validate metric value: {e}. "
+                    f"Unexpected error parsing metric value: {e}. "
                     f"Skipping this metric but continuing collection."
                 )
                 return None
-                
-        except Exception as e:
-            self.logger.warning(
-                f"Unexpected error parsing metric value: {e}. "
-                f"Skipping this metric but continuing collection."
-            )
-            return None
 
     def _extract_label_values(
         self,
