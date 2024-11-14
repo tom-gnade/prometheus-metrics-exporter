@@ -138,34 +138,28 @@ services:
                         type: "gauge"
                         description: "Main process ID of algod"
                         filter: "(?m)^MainPID[=:] *([0-9]+)$"
-                    
                     tasks_current:
                         type: "gauge"
                         description: "Current number of tasks"
                         filter: "(?m)^TasksCurrent[=:] *([0-9]+)$"
-                    
                     tasks_max:
                         type: "gauge"
                         description: "Maximum allowed tasks"
                         filter: "(?m)^TasksMax[=:] *([0-9]+)$"
-                    
                     memory_bytes:
                         type: "gauge"
                         description: "Current memory usage in bytes"
                         filter: "(?m)^MemoryCurrent[=:] *([0-9]+)$"
-                    
                     cpu_seconds_total:
                         type: "counter"
                         description: "Total CPU time consumed in seconds"
                         filter: "(?m)^CPUUsageNSec[=:] *([0-9]+)$"
                         transform: "unix_nano_to_sec(value)"
-                    
                     uptime_seconds:
                         type: "gauge"
                         description: "Process uptime in seconds"
-                        filter: "(?m)^ExecMainStartTimestamp[=:] *([0-9]+)$"
-                        transform: "now - unix_micro_to_sec(value)"
-
+                        filter: "(?m)^ExecMainStartTimestamp=(.+)$"
+                        transform: "now - to_timestamp(value, '%a %Y-%m-%d %H:%M:%S %Z')"
             api_health:
                 command: "curl -so /dev/null -w '%{http_code}' http://localhost:8080/health"
                 description: "Algorand API health check"
@@ -174,8 +168,7 @@ services:
                         type: "gauge"
                         description: "Whether the API health check succeeded (1=healthy, 0=unhealthy)"
                         filter: "^([0-9]+)$"
-                        transform: "value == 200 and 1 or 0"
-
+                        transform: "int(value) == 200 and 1 or 0"
             data_store:
                 command: "du -sb /var/lib/algorand"
                 description: "Algorand data directory size"
