@@ -91,84 +91,84 @@ services:
                 # Group level labels identify this node instance
                 labels:
                     genesis_id:
-                        filter: "Genesis ID:\\s*([^\\n]+)"
+                        filter: "(?m)^Genesis ID:\\s*([^\\n]+)"
                     genesis_hash:
-                        filter: "Genesis hash:\\s*([^\\n]+)"
+                        filter: "(?m)^Genesis hash:\\s*([^\\n]+)"
                     last_catchpoint:
-                        filter: "Last Catchpoint:\\s*([^\\n]+)"
+                        filter: "(?m)^Last Catchpoint:\\s*([^\\n]+)"
                 metrics:
                     sync_time_seconds:
                         type: "gauge"
                         description: "Node synchronization time in seconds"
-                        filter: "Sync Time: ([0-9.]+)s"
+                        filter: "(?m)^Sync Time: ([0-9.]+)s"
                     
                     last_block_age_seconds:
                         type: "gauge" 
                         description: "Time since last block in seconds"
-                        filter: "Time since last block: ([0-9.]+)s"
+                        filter: "(?m)^Time since last block: ([0-9.]+)s"
                    
                     last_committed_round:
                         type: "gauge"
                         description: "Last committed round number"
-                        filter: "Last committed block: ([0-9]+)"
+                        filter: "(?m)^Last committed block: ([0-9]+)"
                    
                     next_consensus_round:
                         type: "gauge"
                         description: "Round number for next consensus protocol"
-                        filter: "Round for next consensus protocol: ([0-9]+)"
+                        filter: "(?m)^Round for next consensus protocol: ([0-9]+)"
                    
                     consensus_upgrade_ready:
                         type: "gauge"
                         description: "Whether next consensus protocol is supported (1=true, 0=false)"
-                        filter: "Next consensus protocol supported: (true|false)"
+                        filter: "(?m)^Next consensus protocol supported: (true|false)"
                         transform: "value.lower() == 'true' and 1 or 0"
                         labels:
                             next_protocol:
-                                filter: "Next consensus protocol: (.+)$"
+                                filter: "(?m)^Next consensus protocol: (.+)$"
                             current_protocol:
-                                filter: "Last consensus protocol: (.+)$"
+                                filter: "(?m)^Last consensus protocol: (.+)$"
 
             process_stats:
                 command: "systemctl show algorand.service -p MainPID -p TasksCurrent -p TasksMax -p MemoryCurrent -p CPUUsageNSec -p ActiveState -p SubState -p ExecMainStartTimestamp -p ExecStart"
                 description: "Algorand process metrics from systemd"
                 labels:
                     active_state:
-                        filter: "^ActiveState[=:] *(.+)$"
+                        filter: "(?m)^ActiveState[=:] *(.+)$"
                     sub_state:
-                        filter: "^SubState[=:] *(.+)$"
+                        filter: "(?m)^SubState[=:] *(.+)$"
                     data_dir:
-                        filter: "ExecStart=.*-d ([^ ]+)"
+                        filter: "(?m)^ExecStart=.*-d ([^ ]+)"
                 metrics:
                     pid:
                         type: "gauge"
                         description: "Main process ID of algod"
-                        filter: "^MainPID[=:] *([0-9]+)$"
+                        filter: "(?m)^MainPID[=:] *([0-9]+)$"
                     
                     tasks_current:
                         type: "gauge"
                         description: "Current number of tasks"
-                        filter: "^TasksCurrent[=:] *([0-9]+)$"
+                        filter: "(?m)^TasksCurrent[=:] *([0-9]+)$"
                     
                     tasks_max:
                         type: "gauge"
                         description: "Maximum allowed tasks"
-                        filter: "^TasksMax[=:] *([0-9]+)$"
+                        filter: "(?m)^TasksMax[=:] *([0-9]+)$"
                     
                     memory_bytes:
                         type: "gauge"
                         description: "Current memory usage in bytes"
-                        filter: "^MemoryCurrent[=:] *([0-9]+)$"
+                        filter: "(?m)^MemoryCurrent[=:] *([0-9]+)$"
                     
                     cpu_seconds_total:
                         type: "counter"
                         description: "Total CPU time consumed in seconds"
-                        filter: "^CPUUsageNSec[=:] *([0-9]+)$"
+                        filter: "(?m)^CPUUsageNSec[=:] *([0-9]+)$"
                         transform: "unix_nano_to_sec(value)"
                     
                     uptime_seconds:
                         type: "gauge"
                         description: "Process uptime in seconds"
-                        filter: "^ExecMainStartTimestamp[=:] *([0-9]+)$"
+                        filter: "(?m)^ExecMainStartTimestamp[=:] *([0-9]+)$"
                         transform: "now - unix_micro_to_sec(value)"
 
             api_health:

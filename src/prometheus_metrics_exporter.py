@@ -2111,45 +2111,38 @@ class MetricsCollector:
         self.logger.verbose("\n=== Starting prometheus metrics update ===")
         self.logger.verbose(f"Received {len(metrics)} metrics to update")
 
-        # Sort metrics by key for consistent updates
-        sorted_metrics = sorted(metrics.items())
-        
-        for key, (identifier, value) in sorted_metrics:
+        for key, (identifier, value) in sorted(metrics.items()):
             try:
                 self.logger.verbose(f"\n--- Processing metric key: {key} ---")
-                metric_name = identifier.prometheus_name
                 
                 # Create metric if it doesn't exist
                 if key not in self._prometheus_metrics:
-                    self.logger.verbose(f"Creating new prometheus metric for {key}")
+                    label_names = [label.name for label in identifier.labels]
+                    self.logger.verbose(f"Creating new metric {key} with labels: {label_names}")
                     metric = self._create_prometheus_metric(identifier)
                     self._prometheus_metrics[key] = metric
-                    self.logger.verbose(f"Created new metric with type: {type(metric)}")
-                else:
-                    metric = self._prometheus_metrics[key]
+
+                metric = self._prometheus_metrics[key]
                 
                 if value is not None:
-                    # Get the metric with labels if they exist
+                    # Apply labels if present
                     if identifier.labels:
-                        label_values = identifier.get_label_dict()  # Use the method for proper None handling
-                        self.logger.verbose(f"Applying labels: {label_values}")
-                        metric = metric.labels(**label_values)
+                        label_dict = identifier.get_label_dict()
+                        self.logger.verbose(f"Setting metric with labels: {label_dict}")
+                        metric = metric.labels(**label_dict)
                     
-                    # Update the metric value
+                    # Update value
+                    self.logger.verbose(f"Setting value: {value}")
                     if isinstance(metric, Counter):
                         prev_value = self._previous_values.get(key, 0)
                         if value > prev_value:
                             increment = value - prev_value
                             metric.inc(increment)
                         self._previous_values[key] = value
-                    else:  # Gauge
+                    else:
                         metric.set(value)
-
             except Exception as e:
-                self.logger.error(
-                    f"Failed to update metric {identifier.prometheus_name}: {e}",
-                    exc_info=True
-                )
+                self.logger.error(f"Failed to update metric {key}: {e}")
 
     def _update_internal_metrics(self, successes: int, errors: int, duration: float):
         """Update internal metrics."""
@@ -2180,9 +2173,11 @@ class MetricsCollector:
                 self.service_collectors
             )
             
-            # Process results from each service
+            # CHANGE STARTS HERE
+            # Process results from each service into a single update batch
+            metrics_to_update = {}
             for service_name, metrics in service_results.items():
-                self.logger.verbose(f"Processing results for service {service_name}: {metrics}")
+                self.logger.verbose(f"Processing results for service {service_name}")
                 if isinstance(metrics, Dict):
                     # Track success/failure for each individual metric
                     for metric_key, metric_result in metrics.items():
@@ -2191,8 +2186,7 @@ class MetricsCollector:
                                 self.logger.error(f"Failed to collect metric {metric_key}: {metric_result}")
                                 errors += 1
                             else:
-                                # Update Prometheus metrics with the collected values
-                                self._update_prometheus_metrics({metric_key: metric_result})
+                                metrics_to_update[metric_key] = metric_result
                                 success_count += 1
                         except Exception as e:
                             self.logger.error(f"Failed to process metric {metric_key}: {e}")
@@ -2200,6 +2194,11 @@ class MetricsCollector:
                 else:
                     self.logger.error(f"Failed to collect any metrics for service {service_name}")
                     errors += 1
+            
+            # Update all metrics in a single batch
+            if metrics_to_update:
+                self._update_prometheus_metrics(metrics_to_update)
+            # CHANGE ENDS HERE
             
             # Debug log final metrics state
             self.logger.debug(f"Current metrics count: {len(self._prometheus_metrics)}")
