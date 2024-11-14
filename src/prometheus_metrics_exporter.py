@@ -507,13 +507,11 @@ class ProgramConfig:
         group_config: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """Validate metric group configuration."""
-        self.logger.verbose(f"=== Validating metric group {group_name} in service {service_name} ===")
-        self.logger.verbose(f"Raw group config: {json.dumps(group_config, indent=2)}")
+        self.logger.verbose(f"Validating metric group {group_name} in service {service_name}")
 
         if not isinstance(group_config, dict):
             raise MetricConfigurationError("Must be a dictionary")
 
-        self.logger.verbose(f"Validating metric group {group_name} in service {service_name}")
         validated = {'metrics': {}}
         
         # Determine group type
@@ -524,7 +522,9 @@ class ProgramConfig:
         # Get group content type and validate filters (for dynamic groups only)
         if group_type == MetricGroupType.DYNAMIC:
             content_type = ContentType(group_config.get('content_type', 'text'))
-            self.logger.verbose(f"Group content type: {content_type.value}")
+            if 'command' not in group_config:
+                raise MetricConfigurationError("Dynamic metric group must specify a command")
+            validated['command'] = group_config['command']
 
             # Validate group-level labels if present
             if 'labels' in group_config:
@@ -553,22 +553,10 @@ class ProgramConfig:
                                 f"in metric '{metric_name}' label '{label_name}': {label_config['filter']}"
                             )
         
-                # Check transforms
-                if 'transform' in metric_config:
-                    if not isinstance(metric_config['transform'], str) or not metric_config['transform'].strip():
-                        raise MetricConfigurationError("Transform must be a non-empty string")
-                    validated_metric['transform'] = metric_config['transform']
-
         # Process static metrics
         if group_type == MetricGroupType.STATIC:
-            metrics_count = len(group_config.get('metrics', {}))
-            self.logger.verbose(f"Found {metrics_count} static metrics to validate")
-            
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    self.logger.verbose(f"\n--- Validating static metric: {metric_name} ---")
-                    self.logger.verbose(f"Raw metric config: {json.dumps(metric_config, indent=2)}")
-                    
                     # Ensure no metric_type is specified for static metrics
                     if 'type' in metric_config:
                         raise MetricConfigurationError(
@@ -585,28 +573,14 @@ class ProgramConfig:
                         'description': metric_config['description'],
                         'value': float(metric_config['value'])
                     }
-                    self.logger.verbose(f"Static metric {metric_name} validated successfully")
                 except Exception as e:
                     self.logger.error(f"Failed to validate static metric {metric_name}: {e}")
                     raise
         
         else:  # DYNAMIC
-            # Validate dynamic metrics group
-            self.logger.verbose(f"Validating dynamic metric group {group_name}")
-            if 'command' not in group_config:
-                raise MetricConfigurationError("Dynamic metric group must specify a command")
-            validated['command'] = group_config['command']
-            self.logger.verbose(f"Command validated: {group_config['command']}")
-            
-            metrics_count = len(group_config.get('metrics', {}))
-            self.logger.verbose(f"Found {metrics_count} dynamic metrics to validate")
-            
             # Validate dynamic metrics
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    self.logger.verbose(f"\n--- Validating dynamic metric: {metric_name} ---")
-                    self.logger.verbose(f"Raw metric config before validation: {json.dumps(metric_config, indent=2)}")
-                    
                     # Ensure no static metrics in dynamic groups
                     if metric_config.get('type', '').lower() == 'static':
                         raise MetricConfigurationError(
@@ -615,8 +589,6 @@ class ProgramConfig:
                         )
                     
                     metric_type = MetricType.from_config(metric_config)
-                    self.logger.verbose(f"Metric type validated as: {metric_type.value}")
-
                     if 'description' not in metric_config:
                         raise MetricConfigurationError("Missing required field: description")
                     if 'filter' not in metric_config:
@@ -625,48 +597,38 @@ class ProgramConfig:
                     validated_metric = {
                         'type': metric_type.value,
                         'description': metric_config['description'],
-                        'filter': metric_config['filter']
+                        'filter': metric_config['filter'],
+                        'content_type': content_type.value
                     }
-                    self.logger.verbose(f"Basic metric validation complete")
+                    
+                    # Handle transforms for dynamic metrics only
+                    if 'transform' in metric_config:
+                        if not isinstance(metric_config['transform'], str) or not metric_config['transform'].strip():
+                            raise MetricConfigurationError("Transform must be a non-empty string")
+                        validated_metric['transform'] = metric_config['transform']
                     
                     # Handle labels if present
                     if 'labels' in metric_config:
-                        self.logger.verbose(f"Found {len(metric_config['labels'])} labels to validate")
-                        self.logger.verbose(f"Raw labels config: {json.dumps(metric_config['labels'], indent=2)}")
                         validated_labels = {}
                         for label_name, label_config in metric_config['labels'].items():
-                            self.logger.verbose(f"Validating label: {label_name}")
-                            self.logger.verbose(f"Label config: {json.dumps(label_config, indent=2)}")
                             if not isinstance(label_config, dict):
                                 raise MetricConfigurationError(f"Label {label_name} configuration must be a dictionary")
                             if 'filter' not in label_config:
                                 raise MetricConfigurationError(f"Label {label_name} must specify a filter")
                             validated_labels[label_name] = {
                                 'filter': label_config['filter'],
-                                'content_type': content_type.value  # Use group's content type
+                                'content_type': content_type.value
                             }
-                            self.logger.verbose(f"Label {label_name} validated successfully")
                         validated_metric['labels'] = validated_labels
-                        self.logger.verbose(f"All labels validated: {json.dumps(validated_labels, indent=2)}")
-                    else:
-                        self.logger.verbose("No labels found for this metric")
-                    
-                    # Store content type from group level
-                    validated_metric['content_type'] = content_type.value
-                    self.logger.verbose(f"Using group content type: {content_type.value}")
                     
                     validated['metrics'][metric_name] = validated_metric
-                    self.logger.verbose(f"Final validated metric: {json.dumps(validated_metric, indent=2)}")
-                    self.logger.verbose(f"Dynamic metric {metric_name} validated successfully")
                     
                 except Exception as e:
                     self.logger.error(f"Failed to validate metric {metric_name}: {e}")
                     raise
 
         metric_count = len(validated['metrics'])
-        self.logger.verbose(f"\n=== Metric group validation complete ===")
-        self.logger.verbose(f"Successfully validated {metric_count} metrics")
-        self.logger.verbose(f"Final validated config: {json.dumps(validated, indent=2)}")
+        self.logger.verbose(f"Validated {metric_count} metrics in group {group_name}")
 
         if not validated['metrics']:
             raise MetricConfigurationError("No valid metrics defined")
@@ -1254,6 +1216,7 @@ class ContentType(Enum):
             if logger:
                 logger.warning(f"Filter validation failed: {e}")
             return False
+        return False  # Only hit if it's not TEXT or JSON
 
     def parse_value(self, content: str, filter_expr: str, logger: logging.Logger, convert_to_float: bool = True) -> Optional[Union[float, str]]:
         """Parse content based on content type."""
