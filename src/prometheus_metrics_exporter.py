@@ -2434,8 +2434,6 @@ class HealthCheck:
         metrics_info = OrderedDict()
         services_config = self.config.services
         
-        self.logger.debug(f"Available prometheus metrics: {list(self._prometheus_metrics.keys())}")
-        
         for service_name in sorted(services_config.keys()):
             service_config = services_config[service_name]
             service_info = {
@@ -2446,17 +2444,16 @@ class HealthCheck:
             
             for group_name in sorted(service_config.get("metric_groups", {}).keys()):
                 group_config = service_config["metric_groups"][group_name]
-                metrics = group_config.get("metrics", {})
+                group_type = MetricGroupType.from_config(group_config)
                 
-                # Get all metrics regardless of prometheus registration
                 group_info = {
-                    "type": MetricGroupType.from_config(group_config).value,
-                    "command": group_config.get("command", ""),
+                    "type": group_type.value,
+                    "command": group_config.get("command", "") if group_type == MetricGroupType.DYNAMIC else None,
+                    "labels": group_config.get("labels", {}),  # Add group-level labels
                     "metrics": OrderedDict()
                 }
                 
-                for metric_name in sorted(metrics.keys()):
-                    metric_config = metrics[metric_name]
+                for metric_name, metric_config in sorted(group_config.get("metrics", {}).items()):
                     metric_info = OrderedDict([
                         ("type", metric_config.get("type", "static")),
                         ("description", metric_config.get("description", "")),
@@ -2464,14 +2461,15 @@ class HealthCheck:
                         ("settings", OrderedDict([
                             ("content_type", metric_config.get("content_type", "text")),
                             ("filter", metric_config.get("filter", "")),
-                            ("transform", metric_config.get("transform", ""))
+                            ("transform", metric_config.get("transform", "")),
+                            ("labels", metric_config.get("labels", {}))  # Add metric-level labels
                         ]))
                     ])
                     group_info["metrics"][metric_name] = metric_info
                 
                 if group_info["metrics"]:
                     service_info["metric_groups"][group_name] = group_info
-            
+                    
             if service_info["metric_groups"]:
                 metrics_info[service_name] = service_info
 
