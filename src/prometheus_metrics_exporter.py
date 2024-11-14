@@ -2301,32 +2301,39 @@ def _update_prometheus_metrics(self, metrics: Dict[str, tuple[MetricIdentifier, 
                 self.service_collectors
             )
             
-            # CHANGE STARTS HERE
             # Process results from each service into a single update batch
             metrics_to_update = {}
             for service_name, metrics in service_results.items():
                 self.logger.verbose(f"Processing results for service {service_name}")
-                if isinstance(metrics, Dict):
+                if isinstance(metrics, Dict) and metrics:  # Added explicit empty dict check
                     # Track success/failure for each individual metric
                     for metric_key, metric_result in metrics.items():
                         try:
-                            if metric_result is None or isinstance(metric_result, Exception):
-                                self.logger.error(f"Failed to collect metric {metric_key}: {metric_result}")
+                            if not isinstance(metric_result, tuple) or len(metric_result) != 2:  # Added type validation
+                                self.logger.error(f"Invalid metric result format for {metric_key}: {metric_result}")
                                 errors += 1
-                            else:
-                                metrics_to_update[metric_key] = metric_result
-                                success_count += 1
+                                continue
+                                
+                            identifier, value = metric_result
+                            if value is None:
+                                self.logger.error(f"Null value for metric {metric_key}")
+                                errors += 1
+                                continue
+                                
+                            metrics_to_update[metric_key] = metric_result
+                            success_count += 1
+                            
                         except Exception as e:
                             self.logger.error(f"Failed to process metric {metric_key}: {e}")
                             errors += 1
                 else:
-                    self.logger.error(f"Failed to collect any metrics for service {service_name}")
+                    self.logger.error(f"Failed to collect metrics for {service_name}: empty or invalid result")
                     errors += 1
             
             # Update all metrics in a single batch
             if metrics_to_update:
+                self.logger.verbose(f"Updating {len(metrics_to_update)} metrics in batch")
                 self._update_prometheus_metrics(metrics_to_update)
-            # CHANGE ENDS HERE
             
             # Debug log final metrics state
             self.logger.debug(f"Current metrics count: {len(self._prometheus_metrics)}")
