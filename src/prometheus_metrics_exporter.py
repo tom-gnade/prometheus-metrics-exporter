@@ -605,6 +605,8 @@ class ProgramConfig:
 
             # Validate labels if present
             if 'labels' in metric_config:
+                self.logger.verbose(f"Validating labels for metric {metric_name}")
+                self.logger.verbose(f"Label config: {json.dumps(metric_config['labels'], indent=2)}")
                 if not isinstance(metric_config['labels'], dict):
                     raise MetricConfigurationError("Labels must be a dictionary")
             
@@ -776,7 +778,7 @@ class ProgramLogger:
     """Manages logging configuration and setup."""
     
     # Verbose logging config
-    VERBOSE_DEBUG = False
+    VERBOSE_DEBUG = True
     VERBOSE_LEVEL = 15  # DEBUG 10, INFO 20
 
     class VerboseLogger(logging.Logger):
@@ -1115,12 +1117,18 @@ class ContentType(Enum):
         """Parse content based on content type."""
         try:
             if self == ContentType.TEXT:
+                logger.verbose(f"Attempting TEXT match with pattern: {filter_expr}")
+                logger.verbose(f"Against content: {content}")
                 match = re.search(filter_expr, content)
                 if not match:
+                    logger.verbose("Pattern did not match content")
                     raise MetricValidationError("Pattern did not match content")
                 try:
-                    return float(match.group(1))
+                    value = match.group(1)
+                    logger.verbose(f"Extracted value: {value}")
+                    return float(value)
                 except (TypeError, ValueError) as e:
+                    logger.verbose(f"Value conversion failed: {e}")
                     raise MetricValidationError(f"Could not convert '{match.group(1)}' to float: {e}")
                 
             elif self == ContentType.JSON:
@@ -1595,34 +1603,48 @@ class ServiceMetricsCollector:
         group_config: Dict
     ) -> Dict[str, tuple[MetricIdentifier, float]]:
         """Collect metrics for a dynamic group."""
-        self.logger.debug(f"Starting collection for dynamic group {group_name}")
-        self.logger.verbose(f"Group config: {group_config}")
+        self.logger.verbose(f"=== Starting collection for group {group_name} ===")
+        self.logger.verbose(f"Full group config: {json.dumps(group_config, indent=2)}")
         results = {}
         
         try:
             # Execute command for dynamic metrics
             command = group_config['command']
-            self.logger.debug(f"Executing command: {command}")
+            self.logger.verbose(f"Executing command: {command}")
             result = await self.command_executor.execute_command(command, self.user_context)
-            self.logger.verbose(f"Command execution result: {result}")
+            self.logger.verbose(f"Command execution result: {result.output}")
             
             if not result.success:
-                self.logger.error(f"Command failed for group {group_name}: {result.error_message}")
+                self.logger.error(f"Command failed: {result.error_message}")
                 return results
 
             # Parse metrics from command output
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    self.logger.debug(f"Processing metric {metric_name}")
-                    self.logger.verbose(f"Metric config: {metric_config}")
+                    self.logger.verbose(f"Processing metric {metric_name}")
+                    self.logger.verbose(f"Full metric config: {json.dumps(metric_config, indent=2)}")
                     
                     metric_type = MetricType.from_config(metric_config)
+                    self.logger.verbose(f"Metric type: {metric_type}")
+
+                    # Detail label processing
+                    self.logger.verbose("Checking for labels...")
+                    if 'labels' in metric_config:
+                        self.logger.verbose(f"Found labels config: {json.dumps(metric_config['labels'], indent=2)}")
+                        for label_name, label_config in metric_config['labels'].items():
+                            self.logger.verbose(f"Processing label '{label_name}' with config: {label_config}")
+                            self.logger.verbose(f"Label filter: {label_config['filter']}")
 
                     # Extract label values if present
                     labels = []
                     if 'labels' in metric_config:
+                        self.logger.verbose("Starting label value extraction...")
                         labels = self._extract_label_values(result.output, metric_config['labels'])
+                        self.logger.verbose(f"Extracted labels: {[{'name': l.name, 'value': l.value, 'filter': l.filter} for l in labels]}")
+                    else:
+                        self.logger.verbose("No labels defined for this metric")
 
+                    self.logger.verbose("Creating MetricIdentifier...")
                     identifier = MetricIdentifier(
                         service = self.service_name,
                         group = group_name,
@@ -1632,6 +1654,8 @@ class ServiceMetricsCollector:
                         description = metric_config['description'],
                         labels = labels
                     )
+                    self.logger.verbose(f"Created identifier: {identifier}")
+                    self.logger.verbose(f"Identifier labels: {[{'name': l.name, 'value': l.value} for l in identifier.labels]}")
                     
                     value = self._parse_metric_value(result.output, metric_config, metric_type)
                     self.logger.verbose(f"Parsed value for {metric_name}: {value}")
@@ -1639,12 +1663,20 @@ class ServiceMetricsCollector:
                     if value is not None:
                         # Use metric name as key
                         key = f"{self.service_name}_{group_name}_{metric_name}"
+                        self.logger.verbose(f"Using key: {key}")
                         results[key] = (identifier, value)
-                        self.logger.debug(f"Collected dynamic metric {metric_name} = {value}")
+                        self.logger.verbose(f"Added to results with identifier hash: {hash(identifier)}")
                         
                 except Exception as e:
-                    self.logger.error(f"Failed to collect dynamic metric {metric_name}: {e}", exc_info=True)
+                    self.logger.error(f"Failed to collect metric {metric_name}: {e}", exc_info=True)
             
+            self.logger.verbose(f"\n=== Group collection results ===")
+            for k, (i, v) in results.items():
+                self.logger.verbose(f"Key: {k}")
+                self.logger.verbose(f"Identifier: {i}")
+                self.logger.verbose(f"Value: {v}")
+                self.logger.verbose(f"Labels: {[{'name': l.name, 'value': l.value} for l in i.labels]}")
+
             return results
                 
         except Exception as e:
@@ -1795,6 +1827,9 @@ class MetricsCollector:
         """Create appropriate Prometheus metric based on identifier."""
         # Get label names from identifier
         label_names = [label.name for label in identifier.labels] if identifier.labels else []
+        self.logger.verbose(f"Creating metric {identifier.prometheus_name}")
+        self.logger.verbose(f"Type: {identifier.type if identifier.type else 'static'}")
+        self.logger.verbose(f"Label names: {label_names}")
 
         if identifier.group_type == MetricGroupType.STATIC:
             return Gauge(
@@ -1826,43 +1861,62 @@ class MetricsCollector:
 
     def _update_prometheus_metrics(self, metrics: Dict[str, tuple[MetricIdentifier, float]]):
         """Update Prometheus metrics with collected values."""
+        self.logger.verbose("\n=== Starting prometheus metrics update ===")
+        self.logger.verbose(f"Received {len(metrics)} metrics to update")
+
         # Sort metrics by key
         sorted_metrics = sorted(metrics.items())
+        self.logger.verbose(f"Sorted metrics keys: {[k for k, _ in sorted_metrics]}")
         
-        self.logger.verbose(f"Attempting to update Prometheus metrics with {len(metrics)} metrics")
-
         for key, (identifier, value) in sorted_metrics:
             try:
+                self.logger.verbose(f"\n--- Processing metric key: {key} ---")
                 metric_name = identifier.prometheus_name
-                self.logger.verbose(f"Processing metric: {metric_name} = {value}")
+                self.logger.verbose(f"Prometheus name: {metric_name}")
+                self.logger.verbose(f"Identifier details: {identifier}")
+                self.logger.verbose(f"Value: {value}")
+                self.logger.verbose(f"Labels present: {bool(identifier.labels)}")
+                if identifier.labels:
+                    self.logger.verbose(f"Label details: {[{'name': l.name, 'value': l.value} for l in identifier.labels]}")
 
                 # Create metric if it doesn't exist
                 if key not in self._prometheus_metrics:
-                    self.logger.debug(f"Creating new Prometheus metric: {metric_name}")
+                    self.logger.verbose(f"Creating new prometheus metric for {key}")
+                    self.logger.verbose(f"Label names: {[l.name for l in identifier.labels]}")
                     metric = self._create_prometheus_metric(identifier)
                     self._prometheus_metrics[key] = metric
+                    self.logger.verbose(f"Created new metric with type: {type(metric)}")
+                else:
+                    self.logger.verbose(f"Using existing metric for {key}")
                 
                 if value is not None:
                     metric = self._prometheus_metrics[key]
+                    self.logger.verbose(f"Base metric type: {type(metric)}")
 
                     # Get the metric with labels if they exist
                     if identifier.labels:
                         label_values = {label.name: label.value for label in identifier.labels}
+                        self.logger.verbose(f"Applying labels: {label_values}")
                         metric = metric.labels(**label_values)
+                        self.logger.verbose(f"Labeled metric type: {type(metric)}")
 
                     # Update the metric value
                     if isinstance(metric, Counter):
                         prev_value = self._previous_values.get(key, 0)
+                        self.logger.verbose(f"Counter previous value: {prev_value}")
                         if value > prev_value:
-                            metric.inc(value - prev_value)
+                            increment = value - prev_value
+                            self.logger.verbose(f"Incrementing by: {increment}")
+                            metric.inc(increment)
                         self._previous_values[key] = value
-                        self.logger.info(f"Updated counter {metric_name} to {value}")
                     else:  # Gauge
+                        self.logger.verbose(f"Setting gauge value to: {value}")
                         metric.set(value)
-                        self.logger.info(f"Set gauge {metric_name} to {value}")
                         
+                    self.logger.verbose("Metric update completed successfully")
+
             except Exception as e:
-                self.logger.error(f"Failed to update metric {identifier.prometheus_name}: {e}")
+                self.logger.error(f"Failed to update metric {identifier.prometheus_name}: {e}", exc_info=True)
 
     def _update_internal_metrics(self, successes: int, errors: int, duration: float):
         """Update internal metrics."""
@@ -2030,98 +2084,107 @@ class HealthCheck:
     def _create_wsgi_app(self):
         """Create WSGI application for health checks."""
         def app(environ, start_response):
-            path = environ.get('PATH_INFO', '').rstrip('/')
-            
-            if path not in ['', '/health']:
-                start_response('404 Not Found', [('Content-Type', 'application/json')])
-                return [self._create_error_response("error", "Not Found")]
+            try:
+                path = environ.get('PATH_INFO', '').rstrip('/')
+                
+                if path not in ['', '/health']:
+                    start_response('404 Not Found', [('Content-Type', 'application/json')])
+                    return [self._create_error_response("error", "Not Found")]
 
-            is_healthy = self.metrics_collector.stats.is_healthy(
-                self.config.failure_threshold
-            )
-            
-            status = '200 OK' if is_healthy else '503 Service Unavailable'
-            headers = [
-                ('Content-Type', 'application/json'),
-                ('Cache-Control', 'no-cache, no-store, must-revalidate')
-            ]
-            start_response(status, headers)
+                is_healthy = self.metrics_collector.stats.is_healthy(
+                    self.config.failure_threshold
+                )
+                
+                status = '200 OK' if is_healthy else '503 Service Unavailable'
+                headers = [
+                    ('Content-Type', 'application/json'),
+                    ('Cache-Control', 'no-cache, no-store, must-revalidate')
+                ]
+                start_response(status, headers)
 
-            response = {
-                "service": {
-                    "status": "healthy" if is_healthy else "unhealthy",
-                    "up": True,
-                    "current_datetime_utc": self.config.now_utc().isoformat(),
-                    "service_start_datetime_utc": self.config._start_time.isoformat(),
-                    "last_metrics_collection_datetime_utc": 
-                        self.metrics_collector.stats.last_collection_datetime.isoformat(),
-                    "uptime_seconds": round(self.config.get_uptime_seconds(), 6),
-                    "process_id": os.getpid(),
-                    "running_as": {
-                        "user": self.config.exporter_user,
-                        "uid": os.getuid(),
-                        "gid": os.getgid()
+                response = {
+                    "service": {
+                        "status": "healthy" if is_healthy else "unhealthy",
+                        "up": True,
+                        "current_datetime_utc": self.config.now_utc().isoformat(),
+                        "service_start_datetime_utc": self.config._start_time.isoformat(),
+                        "last_metrics_collection_datetime_utc": 
+                            self.metrics_collector.stats.last_collection_datetime.isoformat(),
+                        "uptime_seconds": round(self.config.get_uptime_seconds(), 6),
+                        "process_id": os.getpid(),
+                        "running_as": {
+                            "user": self.config.exporter_user,
+                            "uid": os.getuid(),
+                            "gid": os.getgid()
+                        },
+                        "systemd_managed": self.config.running_under_systemd
                     },
-                    "systemd_managed": self.config.running_under_systemd
-                },
-                "stats": {
-                    "collection": {
-                        "attempts": self.metrics_collector.stats.attempts,
-                        "successful": self.metrics_collector.stats.successful,
-                        "errors": self.metrics_collector.stats.errors,
-                        "consecutive_failures": self.metrics_collector.stats.consecutive_failures,
-                        "failure_threshold": self.config.failure_threshold,
-                        "timing": {
-                            "last_collection_seconds": round(
-                                self.metrics_collector.stats.last_collection_time, 3
-                            ),
-                            "average_collection_seconds": round(
-                                self.metrics_collector.stats.get_average_collection_time(), 3
-                            )
+                    "stats": {
+                        "collection": {
+                            "attempts": self.metrics_collector.stats.attempts,
+                            "successful": self.metrics_collector.stats.successful,
+                            "errors": self.metrics_collector.stats.errors,
+                            "consecutive_failures": self.metrics_collector.stats.consecutive_failures,
+                            "failure_threshold": self.config.failure_threshold,
+                            "timing": {
+                                "last_collection_seconds": round(
+                                    self.metrics_collector.stats.last_collection_time, 3
+                                ),
+                                "average_collection_seconds": round(
+                                    self.metrics_collector.stats.get_average_collection_time(), 3
+                                )
+                            }
+                        },
+                        "configuration": {
+                            "poll_interval_seconds": self.config.poll_interval,
+                            "max_workers": self.config.max_workers,
+                            "collection_timeout_seconds": self.config.collection_timeout
                         }
                     },
-                    "configuration": {
-                        "poll_interval_seconds": self.config.poll_interval,
-                        "max_workers": self.config.max_workers,
-                        "collection_timeout_seconds": self.config.collection_timeout
-                    }
-                },
-                "files": {
-                    "script": {
-                        "name": self.config._source.base_name,
-                        "path": str(self.config._source.script_path.resolve()),
-                        "directory": str(self.config._source.script_dir)
-                    },
-                    "config": {
-                        "path": str(self.config._source.config_path),
-                        "last_modified_utc": datetime.fromtimestamp(
-                            self.config._source.config_path.stat().st_mtime, 
-                            tz=timezone.utc
-                        ).isoformat()
-                    },
-                    "log": {
-                        "path": str(self.config._source.log_path),
-                        "level": self.config.logging.get('level', 'DEBUG'),
-                        "file_level": self.config.logging.get('file_level', 'DEBUG'),
-                        "console_level": self.config.logging.get('console_level', 'INFO'),
-                        "journal_level": self.config.logging.get('journal_level', 'WARNING'),
-                        "max_size_bytes": self.config.logging.get('max_bytes', 10485760),
-                        "backup_count": self.config.logging.get('backup_count', 3)
-                    },
-                    "sudoers": {
-                        "path": str(self.config._source.sudoers_path),
-                        "file": self.config._source.sudoers_file
+                    "files": {
+                        "script": {
+                            "name": self.config._source.base_name,
+                            "path": str(self.config._source.script_path.resolve()),
+                            "directory": str(self.config._source.script_dir)
+                        },
+                        "config": {
+                            "path": str(self.config._source.config_path),
+                            "last_modified_utc": datetime.fromtimestamp(
+                                self.config._source.config_path.stat().st_mtime, 
+                                tz=timezone.utc
+                            ).isoformat()
+                        },
+                        "log": {
+                            "path": str(self.config._source.log_path),
+                            "level": self.config.logging.get('level', 'DEBUG'),
+                            "file_level": self.config.logging.get('file_level', 'DEBUG'),
+                            "console_level": self.config.logging.get('console_level', 'INFO'),
+                            "journal_level": self.config.logging.get('journal_level', 'WARNING'),
+                            "max_size_bytes": self.config.logging.get('max_bytes', 10485760),
+                            "backup_count": self.config.logging.get('backup_count', 3)
+                        },
+                        "sudoers": {
+                            "path": str(self.config._source.sudoers_path),
+                            "file": self.config._source.sudoers_file
+                        }
                     }
                 }
-            }
 
-            # Add metrics inventory if requested
-            if environ.get('QUERY_STRING') == 'include_metrics=true':
-                response["metrics"] = self._get_metrics_inventory()
-            
-            return [json.dumps(response, indent=2).encode()]
+                # Add metrics inventory if requested
+                if environ.get('QUERY_STRING') == 'include_metrics=true':
+                    self.logger.verbose("Generating metrics inventory...")
+                    metrics = self._get_metrics_inventory()
+                    self.logger.verbose(f"Generated inventory: {json.dumps(metrics, indent=2)}")
+                    response["metrics"] = metrics
+                
+                return [json.dumps(response, indent=2).encode()]
         
-        return app
+            except Exception as e:
+                self.logger.error(f"Health check error: {e}", exc_info=True)
+                start_response('500 Internal Server Error', [('Content-Type', 'application/json')])
+                return [self._create_error_response("error", str(e))]
+
+            return app
     
     def _get_metrics_inventory(self) -> Dict[str, Any]:
         """Get metrics inventory with collection status."""
