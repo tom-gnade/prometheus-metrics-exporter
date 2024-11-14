@@ -1593,9 +1593,9 @@ class ServiceMetricsCollector:
         self,
         group_name: str,
         group_config: Dict
-    ) -> Dict[MetricIdentifier, float]:
+    ) -> Dict[str, tuple[MetricIdentifier, float]]:
         """Collect metrics for a dynamic group."""
-        self.logger.info(f"Starting collection for dynamic group {group_name}")
+        self.logger.debug(f"Starting collection for dynamic group {group_name}")
         self.logger.verbose(f"Group config: {group_config}")
         results = {}
         
@@ -1613,8 +1613,8 @@ class ServiceMetricsCollector:
             # Parse metrics from command output
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    self.logger.info(f"Processing metric {metric_name}")
-                    self.logger.info(f"Metric config: {metric_config}")
+                    self.logger.debug(f"Processing metric {metric_name}")
+                    self.logger.verbose(f"Metric config: {metric_config}")
                     
                     metric_type = MetricType.from_config(metric_config)
 
@@ -1624,21 +1624,23 @@ class ServiceMetricsCollector:
                         labels = self._extract_label_values(result.output, metric_config['labels'])
 
                     identifier = MetricIdentifier(
-                        service=self.service_name,
-                        group=group_name,
-                        name=metric_name,
-                        group_type=MetricGroupType.DYNAMIC,
-                        type=metric_type,
-                        description=metric_config['description'],
-                        labels=labels
+                        service = self.service_name,
+                        group = group_name,
+                        name = metric_name,
+                        group_type = MetricGroupType.DYNAMIC,
+                        type = metric_type,
+                        description = metric_config['description'],
+                        labels = labels
                     )
                     
                     value = self._parse_metric_value(result.output, metric_config, metric_type)
-                    self.logger.info(f"Parsed value for {metric_name}: {value}")
+                    self.logger.verbose(f"Parsed value for {metric_name}: {value}")
                     
                     if value is not None:
-                        results[identifier] = value
-                        self.logger.info(f"Collected dynamic metric {metric_name} = {value}")
+                        # Use metric name as key
+                        key = f"{self.service_name}_{group_name}_{metric_name}"
+                        results[key] = (identifier, value)
+                        self.logger.debug(f"Collected dynamic metric {metric_name} = {value}")
                         
                 except Exception as e:
                     self.logger.error(f"Failed to collect dynamic metric {metric_name}: {e}", exc_info=True)
@@ -1822,47 +1824,42 @@ class MetricsCollector:
             key = f"{key}_{label_str}"
         return key
 
-    def _update_prometheus_metrics(self, metrics: Dict[MetricIdentifier, float]):
+    def _update_prometheus_metrics(self, metrics: Dict[str, tuple[MetricIdentifier, float]]):
         """Update Prometheus metrics with collected values."""
-        # Sort metrics by service, group, and metric name
-        sorted_metrics = sorted(
-            metrics.items(),
-            key=lambda x: (x[0].service, x[0].group, x[0].name)
-        )
+        # Sort metrics by key
+        sorted_metrics = sorted(metrics.items())
         
-        self.logger.info(f"Updating Prometheus metrics with {len(metrics)} metrics")
-        for identifier, value in sorted_metrics:
+        self.logger.verbose(f"Attempting to update Prometheus metrics with {len(metrics)} metrics")
+
+        for key, (identifier, value) in sorted_metrics:
             try:
+                metric_name = identifier.prometheus_name
+                self.logger.verbose(f"Processing metric: {metric_name} = {value}")
 
-                metric_key = self._get_metric_key(identifier)
-
-               # Create metric if it doesn't exist
-                if metric_key not in self._prometheus_metrics:
-                    self.logger.info(f"Creating new Prometheus metric: {metric_key}")
+                # Create metric if it doesn't exist
+                if key not in self._prometheus_metrics:
+                    self.logger.debug(f"Creating new Prometheus metric: {metric_name}")
                     metric = self._create_prometheus_metric(identifier)
-                    self._prometheus_metrics[metric_key] = metric
-
+                    self._prometheus_metrics[key] = metric
+                
                 if value is not None:
-                    metric = self._prometheus_metrics[metric_key]
+                    metric = self._prometheus_metrics[key]
 
-                   # Get label values if any
-                    label_values = None 
+                    # Get the metric with labels if they exist
                     if identifier.labels:
                         label_values = {label.name: label.value for label in identifier.labels}
                         metric = metric.labels(**label_values)
 
-                   # Use full key with labels for counter values
-                    full_key = self._get_metric_key(identifier, label_values)
-
+                    # Update the metric value
                     if isinstance(metric, Counter):
-                        prev_value = self._previous_values.get(full_key, 0)
+                        prev_value = self._previous_values.get(key, 0)
                         if value > prev_value:
                             metric.inc(value - prev_value)
-                        self._previous_values[full_key] = value
-                        self.logger.info(f"Updated counter {metric_key} to {value}")
+                        self._previous_values[key] = value
+                        self.logger.info(f"Updated counter {metric_name} to {value}")
                     else:  # Gauge
                         metric.set(value)
-                        self.logger.info(f"Set gauge {metric_key} to {value}")
+                        self.logger.info(f"Set gauge {metric_name} to {value}")
                         
             except Exception as e:
                 self.logger.error(f"Failed to update metric {identifier.prometheus_name}: {e}")
