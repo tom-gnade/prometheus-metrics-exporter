@@ -158,7 +158,7 @@ services:
                     uptime_seconds:
                         type: "gauge" 
                         description: "Process uptime in seconds"
-                        filter: "(?m)^ExecMainStartTimestamp=(\\d+)$
+                        filter: "(?m)^ExecMainStartTimestamp=(\\d+)$"
             api_health:
                 command: "curl -so /dev/null -w '%{http_code}' http://localhost:8080/health"
                 description: "Algorand API health check"
