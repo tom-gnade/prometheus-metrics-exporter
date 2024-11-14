@@ -168,7 +168,7 @@ services:
                         type: "gauge"
                         description: "Whether the API health check succeeded (1=healthy, 0=unhealthy)"
                         filter: "^([0-9]+)$"
-                        transform: "int(value) == 200 and 1 or 0" 
+                        transform: "value == '200' and 1 or 0" 
             data_store:
                 command: "du -sb /var/lib/algorand"
                 description: "Algorand data directory size"
