@@ -507,7 +507,8 @@ class ProgramConfig:
         group_config: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """Validate metric group configuration."""
-        self.logger.verbose(f"Validating metric group {group_name} in service {service_name}")
+        self.logger.verbose(f"=== Validating metric group {group_name} in service {service_name} ===")
+        self.logger.verbose(f"Raw group config: {json.dumps(group_config, indent=2)}")
 
         if not isinstance(group_config, dict):
             raise MetricConfigurationError("Must be a dictionary")
@@ -518,7 +519,7 @@ class ProgramConfig:
         group_type = MetricGroupType.from_config(group_config)
         self.logger.verbose(f"Group type determined as: {group_type.value}")
         validated['type'] = group_type.value
-
+        
         # Get group content type and validate filters (for dynamic groups only)
         if group_type == MetricGroupType.DYNAMIC:
             content_type = ContentType(group_config.get('content_type', 'text'))
@@ -526,14 +527,29 @@ class ProgramConfig:
                 raise MetricConfigurationError("Dynamic metric group must specify a command")
             validated['command'] = group_config['command']
 
-            # Validate group-level labels if present
+            # Validate and store group-level labels if present
+            validated_group_labels = {}
             if 'labels' in group_config:
+                self.logger.verbose(f"Processing group-level labels for {group_name}")
+                self.logger.verbose(f"Group labels config: {json.dumps(group_config['labels'], indent=2)}")
+                
                 for label_name, label_config in group_config['labels'].items():
+                    if not isinstance(label_config, dict):
+                        raise MetricConfigurationError(f"Group label {label_name} configuration must be a dictionary")
+                    if 'filter' not in label_config:
+                        raise MetricConfigurationError(f"Group label {label_name} must specify a filter")
                     if not content_type.validate_filter(label_config['filter']):
                         raise MetricConfigurationError(
                             f"Invalid filter format for {content_type.value} content type "
                             f"in group label '{label_name}': {label_config['filter']}"
                         )
+                    validated_group_labels[label_name] = {
+                        'filter': label_config['filter'],
+                        'content_type': content_type.value
+                    }
+                
+                self.logger.verbose(f"Validated group labels: {json.dumps(validated_group_labels, indent=2)}")
+                validated['labels'] = validated_group_labels
 
             # Pre-validate all metric filters before detailed processing
             for metric_name, metric_config in group_config.get('metrics', {}).items():
@@ -573,6 +589,9 @@ class ProgramConfig:
                         'description': metric_config['description'],
                         'value': float(metric_config['value'])
                     }
+                    # Add group labels to static metrics if present
+                    if 'labels' in validated:
+                        validated['metrics'][metric_name]['group_labels'] = validated['labels']
                 except Exception as e:
                     self.logger.error(f"Failed to validate static metric {metric_name}: {e}")
                     raise
@@ -601,14 +620,20 @@ class ProgramConfig:
                         'content_type': content_type.value
                     }
                     
+                    # Add group labels first if they exist
+                    if 'labels' in validated:
+                        self.logger.verbose(f"Adding group labels to metric {metric_name}")
+                        validated_metric['group_labels'] = validated['labels']
+                    
                     # Handle transforms for dynamic metrics only
                     if 'transform' in metric_config:
                         if not isinstance(metric_config['transform'], str) or not metric_config['transform'].strip():
                             raise MetricConfigurationError("Transform must be a non-empty string")
                         validated_metric['transform'] = metric_config['transform']
                     
-                    # Handle labels if present
+                    # Handle metric-specific labels
                     if 'labels' in metric_config:
+                        self.logger.verbose(f"Processing metric-specific labels for {metric_name}")
                         validated_labels = {}
                         for label_name, label_config in metric_config['labels'].items():
                             if not isinstance(label_config, dict):
@@ -620,6 +645,7 @@ class ProgramConfig:
                                 'content_type': content_type.value
                             }
                         validated_metric['labels'] = validated_labels
+                        self.logger.verbose(f"Added metric-specific labels: {json.dumps(validated_labels, indent=2)}")
                     
                     validated['metrics'][metric_name] = validated_metric
                     
@@ -628,7 +654,8 @@ class ProgramConfig:
                     raise
 
         metric_count = len(validated['metrics'])
-        self.logger.verbose(f"Validated {metric_count} metrics in group {group_name}")
+        self.logger.verbose(f"Successfully validated {metric_count} metrics in group {group_name}")
+        self.logger.verbose(f"Final validated config: {json.dumps(validated, indent=2)}")
 
         if not validated['metrics']:
             raise MetricConfigurationError("No valid metrics defined")
@@ -636,40 +663,49 @@ class ProgramConfig:
         return validated
 
     def _validate_metric(
-            self,
-            service_name: str,
-            group_name: str,
-            metric_name: str,
-            metric_config: Dict[str, Any]
-        ) -> Optional[Dict[str, Any]]:
-            """Validate individual metric configuration."""
-            self.logger.verbose(f"Starting validation of metric {metric_name}")
-            
-            if not isinstance(metric_config, dict):
-                raise MetricConfigurationError("Must be a dictionary")
+        self,
+        service_name: str,
+        group_name: str,
+        metric_name: str,
+        metric_config: Dict[str, Any],
+        group_labels: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Validate individual metric configuration."""
+        self.logger.verbose(f"=== Starting validation of metric {metric_name} ===")
+        self.logger.verbose(f"Raw metric config: {json.dumps(metric_config, indent=2)}")
+        if group_labels:
+            self.logger.verbose(f"Group labels present: {json.dumps(group_labels, indent=2)}")
+        
+        if not isinstance(metric_config, dict):
+            raise MetricConfigurationError("Must be a dictionary")
 
-            validated = {}
+        validated = {}
+        
+        # Validate required fields
+        if 'type' not in metric_config:
+            raise MetricConfigurationError("Missing required field: type")
+        
+        metric_type = MetricType.from_config(metric_config)
+        self.logger.verbose(f"Metric type validated as: {metric_type}")
             
-            # Validate required fields
-            if 'type' not in metric_config:
-                raise MetricConfigurationError("Missing required field: type")
-            
-            metric_type = MetricType.from_config(metric_config)
-            self.logger.verbose(f"Metric {metric_name} type: {metric_type}")
-                
-            if 'description' not in metric_config:
-                raise MetricConfigurationError("Missing required field: description")
+        if 'description' not in metric_config:
+            raise MetricConfigurationError("Missing required field: description")
 
-            validated['type'] = metric_config['type']
-            validated['description'] = metric_config['description']
+        validated['type'] = metric_config['type']
+        validated['description'] = metric_config['description']
 
-            # Validate labels if present
-            if 'labels' in metric_config:
-                self.logger.verbose(f"Validating labels for metric {metric_name}")
-                self.logger.verbose(f"Label config: {json.dumps(metric_config['labels'], indent=2)}")
-                if not isinstance(metric_config['labels'], dict):
-                    raise MetricConfigurationError("Labels must be a dictionary")
-            
+        # Add group labels first if present
+        if group_labels:
+            self.logger.verbose("Adding group labels to metric")
+            validated['group_labels'] = group_labels
+
+        # Validate metric-specific labels if present
+        if 'labels' in metric_config:
+            self.logger.verbose(f"Processing metric-specific labels")
+            self.logger.verbose(f"Label config: {json.dumps(metric_config['labels'], indent=2)}")
+            if not isinstance(metric_config['labels'], dict):
+                raise MetricConfigurationError("Labels must be a dictionary")
+        
             validated_labels = {}
             for label_name, label_config in metric_config['labels'].items():
                 if not isinstance(label_config, dict):
@@ -684,32 +720,33 @@ class ProgramConfig:
                 }
             
             validated['labels'] = validated_labels
+            self.logger.verbose(f"Added metric-specific labels: {json.dumps(validated_labels, indent=2)}")
 
-            try:
-                if metric_type == MetricType.STATIC:
-                    self.logger.verbose(f"Validating static metric {metric_name}")
-                    if 'value' not in metric_config:
-                        raise MetricConfigurationError("Static metric must specify a value")
-                    validated['value'] = float(metric_config['value'])
-                    self.logger.verbose(f"Static metric {metric_name} value: {validated['value']}")
-                else:  # gauge or counter
-                    self.logger.verbose(f"Validating dynamic metric {metric_name}")
-                    if 'filter' not in metric_config:
-                        raise MetricConfigurationError(
-                            f"{metric_type.value} metric must specify a filter"
-                        )
-                    validated['filter'] = metric_config['filter']
+        try:
+            if metric_type == MetricType.STATIC:
+                self.logger.verbose(f"Validating static metric")
+                if 'value' not in metric_config:
+                    raise MetricConfigurationError("Static metric must specify a value")
+                validated['value'] = float(metric_config['value'])
+                self.logger.verbose(f"Static metric value validated: {validated['value']}")
+            else:  # gauge or counter
+                self.logger.verbose(f"Validating dynamic metric")
+                if 'filter' not in metric_config:
+                    raise MetricConfigurationError(
+                        f"{metric_type.value} metric must specify a filter"
+                    )
+                validated['filter'] = metric_config['filter']
 
-                # Copy optional content_type if present
-                if 'content_type' in metric_config:
-                    validated['content_type'] = metric_config['content_type']
+            # Copy optional content_type if present
+            if 'content_type' in metric_config:
+                validated['content_type'] = metric_config['content_type']
 
-                self.logger.verbose(f"Successfully validated metric {metric_name}: {validated}")
-                return validated
+            self.logger.verbose(f"Final validated metric config: {json.dumps(validated, indent=2)}")
+            return validated
 
-            except Exception as e:
-                self.logger.error(f"Error validating metric {metric_name}: {e}", exc_info=True)
-                raise MetricConfigurationError(f"Invalid metric configuration: {e}")
+        except Exception as e:
+            self.logger.error(f"Error validating metric {metric_name}: {e}", exc_info=True)
+            raise MetricConfigurationError(f"Invalid metric configuration: {e}")
 
     def _log_validation_summary(self, initial_load: bool) -> None:
         """Log validation statistics summary."""
