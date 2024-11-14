@@ -1220,91 +1220,60 @@ class ContentType(Enum):
 
     def parse_value(self, content: str, filter_expr: str, logger: logging.Logger, convert_to_float: bool = True) -> Optional[Union[float, str]]:
         """Parse content based on content type."""
-        # Validate filter format first
-        if not self.validate_filter(filter_expr):
-            raise MetricValidationError(
-                f"Invalid filter format '{filter_expr}' for content type {self.value}"
-            )
-
         try:
+            if not content or not filter_expr:
+                logger.verbose("Empty content or filter")
+                return None
+
             if self == ContentType.TEXT:
-                logger.verbose(f"Attempting TEXT match with pattern: {filter_expr}")
-                logger.verbose(f"Against content: {content}")
+                logger.verbose(f"Applying pattern: {filter_expr}")
                 match = re.search(filter_expr, content)
                 if not match:
-                    logger.verbose("Pattern did not match content")
-                    raise MetricValidationError("Pattern did not match content")
-                try:
-                    value = match.group(1)
-                    logger.verbose(f"Extracted value: {value}")
-                    if convert_to_float:
-                        result = float(value)
-                        logger.verbose(f"Converted to float: {result}")
-                        return result
-                    return value
-                except (TypeError, ValueError) as e:
-                    if convert_to_float:
-                        logger.verbose(f"Value conversion failed: {e}")
-                        raise MetricValidationError(f"Could not convert '{match.group(1)}' to float: {e}")
-                    raise MetricValidationError(f"Failed to extract value: {e}")
+                    logger.verbose(f"No match found for pattern")
+                    return None
+                value = match.group(1)
                 
             elif self == ContentType.JSON:
-                logger.verbose(f"Attempting JSON parse and path extraction: {filter_expr}")
-                logger.verbose(f"Raw content: {content}")
                 try:
                     data = json.loads(content)
-                    logger.verbose(f"Successfully parsed JSON: {json.dumps(data, indent=2)}")
-                except json.JSONDecodeError as e:
-                    logger.verbose(f"JSON parse failed: {e}")
-                    raise MetricValidationError(f"Invalid JSON content: {e}")
+                    path_parts = filter_expr.strip('.').split('.')
+                    current_data = data
                     
-                # Handle jq-style filter (e.g. ".status.block_height")
-                path_parts = filter_expr.strip('.').split('.')
-                logger.verbose(f"Path parts to process: {path_parts}")
-                current_data = data
-                
-                for key in path_parts:
-                    logger.verbose(f"Processing path part: {key}")
-                    logger.verbose(f"Current data type: {type(current_data)}")
-                    
-                    if not isinstance(current_data, dict):
-                        logger.verbose(f"ERROR: Expected dict, got {type(current_data)}")
-                        logger.verbose(f"Current data: {current_data}")
-                        raise MetricValidationError(
-                            f"Cannot access '{key}' in path '{filter_expr}': "
-                            f"value '{current_data}' is not an object"
-                        )
-                    if key not in current_data:
-                        logger.verbose(f"ERROR: Key '{key}' not found")
-                        logger.verbose(f"Available keys: {list(current_data.keys())}")
-                        raise MetricValidationError(
-                            f"Key '{key}' not found in path '{filter_expr}': "
-                            f"available keys {list(current_data.keys())}"
-                        )
-                    current_data = current_data[key]
-                    logger.verbose(f"After key '{key}', value is: {current_data}")
-                        
+                    for key in path_parts:
+                        if not isinstance(current_data, dict):
+                            logger.verbose(f"JSON path error: value at '{key}' is not an object")
+                            return None
+                        if key not in current_data:
+                            logger.verbose(f"JSON path error: key '{key}' not found")
+                            return None
+                        current_data = current_data[key]
+                    value = current_data
+                except json.JSONDecodeError:
+                    logger.verbose("Invalid JSON content")
+                    return None
+            else:
+                logger.warning(f"Unsupported content type: {self.value}")
+                return None
+
+            # Special handling for boolean values
+            if isinstance(value, bool) or str(value).lower() in ('true', 'false'):
+                if not convert_to_float:
+                    return str(value).lower()
+                return 1.0 if str(value).lower() == 'true' else 0.0
+
+            # Convert to float if needed
+            if convert_to_float:
                 try:
-                    if convert_to_float:
-                        result = float(current_data)
-                        logger.verbose(f"Successfully converted to float: {result}")
-                        return result
-                    return str(current_data)
-                except (TypeError, ValueError) as e:
-                    logger.verbose(f"Conversion failed: {e}")
-                    logger.verbose(f"Value that failed conversion: {current_data}")
-                    if convert_to_float:
-                        raise MetricValidationError(
-                            f"Could not convert value '{current_data}' to float "
-                            f"at path '{filter_expr}': {e}"
-                        )
-                    raise MetricValidationError(f"Failed to extract value: {e}")
-                    
-        except MetricValidationError:
-            raise
+                    return float(value)
+                except (TypeError, ValueError):
+                    logger.verbose(f"Could not convert '{value}' to float")
+                    return None
+
+            return str(value)
+
         except Exception as e:
-            logger.verbose(f"Unexpected error during {self.value} parsing: {e}")
-            raise MetricValidationError(f"Failed to parse {self.value} response: {e}")
+            logger.verbose(f"Parse error: {str(e)}")
+            return None
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -1744,17 +1713,12 @@ class ServiceMetricsCollector:
         group_name: str,
         group_config: Dict
     ) -> Dict[str, tuple[MetricIdentifier, float]]:
-        """Collect metrics for a dynamic group.
-        
-        A single command execution provides output that is parsed based on the 
-        group's content type. All metrics and labels use the same content type
-        and parse from the same command output.
-        """
+        """Collect metrics for a dynamic group."""
         self.logger.verbose(f"=== Starting collection for group {group_name} ===")
         results = {}
 
         try:
-            # 1. Execute group command once
+            # Execute command and log output for debugging
             command = group_config['command']
             command_result = await self.command_executor.execute_command(
                 command, 
@@ -1762,92 +1726,167 @@ class ServiceMetricsCollector:
             )
             
             if not command_result.success:
-                self.logger.error(f"Group command failed: {command_result.error_message}")
+                self.logger.error(
+                    f"Failed to execute command for group {group_name}:\n"
+                    f"Command: {command}\n"
+                    f"Error: {command_result.error_message}"
+                )
                 return results
 
-            # 2. Get group content type for all parsing
-            output = command_result.output
-            group_content_type = ContentType(group_config.get('content_type', 'text'))
-            self.logger.verbose(f"Using group content type: {group_content_type.value}")
+            # Log command output at verbose level for debugging
+            self.logger.verbose(
+                f"Command output for {group_name}:\n"
+                f"{command_result.output}"
+            )
 
-            # 3. Extract group-level labels using group content type
+            # Get group content type and validate output format
+            output = command_result.output
+            if not output or not output.strip():
+                self.logger.error(f"Command for group {group_name} produced no output")
+                return results
+
+            group_content_type = ContentType(group_config.get('content_type', 'text'))
+            self.logger.verbose(
+                f"Using content type {group_content_type.value} for group {group_name}"
+            )
+
+            # Extract group-level labels first
             group_labels = self._extract_label_values(
                 group_config.get('labels', {}),
                 output,
-                group_content_type  # Pass group's content type
+                group_content_type
             )
 
-            # 4. Process each metric using same output and content type
+            # Process each metric
+            failed_metrics = []
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    # Validate metric type first
                     if 'type' not in metric_config:
-                        self.logger.error(f"Metric {metric_name} missing required type field")
+                        self.logger.warning(f"Metric {metric_name} missing required type field")
                         continue
 
                     metric_type = MetricType.from_config(metric_config)
-
-                    # Extract raw value using group content type - ignore metric's content_type
-                    raw_value = group_content_type.parse_value(
-                        output,
-                        metric_config['filter'],
-                        self.logger,
-                        convert_to_float=False  # Get raw value first
-                    )
+                    raw_value = None
                     
-                    if raw_value is None:
-                        self.logger.warning(f"No value matched for metric {metric_name}")
-                        continue
-
-                    self.logger.verbose(f"Raw value for {metric_name}: {raw_value}")
-
-                    # Validate numeric value for prometheus
                     try:
-                        metric_value = float(raw_value) if raw_value is not None else None
-                    except (TypeError, ValueError) as e:
-                        self.logger.warning(
-                            f"Metric {metric_name}: Could not convert value '{raw_value}' to number"
+                        # First try to extract the raw value
+                        raw_value = group_content_type.parse_value(
+                            output,
+                            metric_config['filter'],
+                            self.logger,
+                            convert_to_float=False
                         )
+                        
+                        if raw_value is None:
+                            self.logger.verbose(
+                                f"No value matched for metric {metric_name} using filter: "
+                                f"{metric_config['filter']}"
+                            )
+                            continue
+
+                        self.logger.verbose(f"Raw value for {metric_name}: {raw_value}")
+
+                        # Handle transforms
+                        final_value = raw_value
+                        if 'transform' in metric_config:
+                            transform = metric_config['transform']
+                            try:
+                                # Prepare evaluation environment
+                                now = datetime.now(timezone.utc).timestamp()
+                                env = {
+                                    'value': raw_value,
+                                    'true': True,
+                                    'false': False,
+                                    'now': now,
+                                    'to_timestamp': lambda dt_str, fmt: datetime.strptime(
+                                        dt_str, fmt
+                                    ).replace(tzinfo=timezone.utc).timestamp(),
+                                    'unix_micro_to_sec': lambda ts: float(ts) / 1_000_000,
+                                    'unix_nano_to_sec': lambda ts: float(ts) / 1_000_000_000,
+                                    'unix_milli_to_sec': lambda ts: float(ts) / 1_000,
+                                }
+                                
+                                final_value = eval(transform, {'__builtins__': {}}, env)
+                                self.logger.verbose(
+                                    f"Transform for {metric_name}:\n"
+                                    f"Expression: {transform}\n"
+                                    f"Input: {raw_value}\n"
+                                    f"Result: {final_value}"
+                                )
+                            except Exception as e:
+                                self.logger.warning(
+                                    f"Transform failed for metric {metric_name}:\n"
+                                    f"Expression: {transform}\n"
+                                    f"Input value: {raw_value}\n"
+                                    f"Error: {str(e)}"
+                                )
+                                continue
+
+                        # Convert to float for Prometheus
+                        try:
+                            metric_value = float(final_value)
+                        except (TypeError, ValueError) as e:
+                            self.logger.warning(
+                                f"Could not convert value for metric {metric_name}:\n"
+                                f"Value: {final_value}\n"
+                                f"Error: {str(e)}"
+                            )
+                            continue
+
+                        # Extract metric-specific labels
+                        metric_labels = self._extract_label_values(
+                            metric_config.get('labels', {}),
+                            output,
+                            group_content_type
+                        )
+
+                        # Create identifier with all labels
+                        identifier = MetricIdentifier(
+                            service=self.service_name,
+                            group=group_name,
+                            name=metric_name,
+                            group_type=MetricGroupType.DYNAMIC,
+                            type=metric_type,
+                            description=metric_config['description'],
+                            labels=group_labels + metric_labels
+                        )
+
+                        key = f"{self.service_name}_{group_name}_{metric_name}"
+                        results[key] = (identifier, metric_value)
+                        
+                    except MetricValidationError as e:
+                        # Handle validation errors without full stack traces
+                        self.logger.verbose(
+                            f"Validation failed for metric {metric_name}:\n"
+                            f"Filter: {metric_config['filter']}\n"
+                            f"Error: {str(e)}"
+                        )
+                        failed_metrics.append((metric_name, str(e)))
                         continue
-
-                    if metric_value is None:
-                        self.logger.warning(f"Null value for metric {metric_name}")
-                        continue
-
-                    # Extract metric labels using group content type
-                    metric_labels = self._extract_label_values(
-                        metric_config.get('labels', {}),
-                        output,
-                        group_content_type  # Use group's content type
-                    )
-
-                    # Create identifier
-                    identifier = MetricIdentifier(
-                        service=self.service_name,
-                        group=group_name,
-                        name=metric_name,
-                        group_type=MetricGroupType.DYNAMIC,
-                        type=metric_type,
-                        description=metric_config['description'],
-                        labels=group_labels + metric_labels
-                    )
-
-                    key = f"{self.service_name}_{group_name}_{metric_name}"
-                    results[key] = (identifier, metric_value)
-                    
+                        
                 except Exception as e:
                     self.logger.error(
-                        f"Failed to process metric {metric_name}: {e}",
-                        exc_info=True
+                        f"Unexpected error processing metric {metric_name}: {str(e)}"
                     )
+                    failed_metrics.append((metric_name, str(e)))
                     continue
+
+            # Summarize collection results
+            if results:
+                self.logger.info(
+                    f"Successfully collected {len(results)} metrics from group {group_name}"
+                )
+            if failed_metrics:
+                self.logger.warning(
+                    f"Failed to collect {len(failed_metrics)} metrics from group {group_name}:\n" +
+                    "\n".join(f"- {name}: {error}" for name, error in failed_metrics)
+                )
 
             return results
                 
-        except MetricValidationError as e:
-            self.logger.warning(f"Failed to collect metric {metric_name}: {e}")
         except Exception as e:
-            self.logger.error(f"Unexpected error collecting metric {metric_name}: {e}")
+            self.logger.error(f"Failed to collect metric group {group_name}: {str(e)}")
+            return {}
     
     # Modify _parse_metric_value:
     def _parse_metric_value(
