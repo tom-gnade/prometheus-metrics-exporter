@@ -1971,35 +1971,34 @@ class ServiceMetricsCollector:
         """Extract label values from command output."""
         if not label_definitions:
             return tuple()
-
-        # Pre-calculate tuple size
-        label_count = len(label_definitions)
-        labels_list = [None] * label_count  # Pre-allocate list
         
-        for idx, (label_name, config) in enumerate(sorted(label_definitions.items())):
+        # Debug logging
+        self.logger.verbose(f"Extracting labels from:\n{output}")
+        self.logger.verbose(f"Label definitions: {json.dumps(label_definitions, indent=2)}")
+
+        labels_list = []
+        for label_name, config in sorted(label_definitions.items()):
             try:
                 raw_value = content_type.parse_value(
                     output,
                     config['filter'],
                     self.logger,
-                    convert_to_float=False
+                    convert_to_float=False  # Important: we want string values
                 )
                 
-                if raw_value is None or str(raw_value).strip() == '':
-                    self.logger.warning(
-                        f"Label '{label_name}' filter produced no value - "
-                        f"filter may be incorrect: {config['filter']}"
-                    )
+                self.logger.verbose(f"Label {label_name}: raw_value={raw_value}")
                 
-                labels_list[idx] = MetricLabel(
-                    name=label_name,
-                    value=str(raw_value) if raw_value is not None else "",
-                    filter=config['filter']
-                )
-                
+                # Important: Only create label if we got a value
+                if raw_value is not None:
+                    labels_list.append(MetricLabel(
+                        name=label_name,
+                        value=str(raw_value).strip(),
+                        filter=config['filter']
+                    ))
+                else:
+                    self.logger.warning(f"No value found for label {label_name} with filter {config['filter']}")
             except Exception as e:
-                self.logger.warning(f"Failed to extract value for label '{label_name}': {e}")
-                labels_list[idx] = MetricLabel(name=label_name)
+                self.logger.error(f"Failed to extract label {label_name}: {e}")
 
         return tuple(labels_list)
 
@@ -2435,7 +2434,8 @@ class HealthCheck:
         metrics_info = OrderedDict()
         services_config = self.config.services
         
-        # Process services in sorted order
+        self.logger.debug(f"Available prometheus metrics: {list(self._prometheus_metrics.keys())}")
+        
         for service_name in sorted(services_config.keys()):
             service_config = services_config[service_name]
             service_info = {
@@ -2444,53 +2444,37 @@ class HealthCheck:
                 "metric_groups": OrderedDict()
             }
             
-            # Process groups in sorted order
             for group_name in sorted(service_config.get("metric_groups", {}).keys()):
                 group_config = service_config["metric_groups"][group_name]
-                group_type = MetricGroupType.from_config(group_config)
+                metrics = group_config.get("metrics", {})
+                
+                # Get all metrics regardless of prometheus registration
                 group_info = {
-                    "type": group_type.value,
-                    "command": group_config.get("command", "") if group_type == MetricGroupType.DYNAMIC else None,
+                    "type": MetricGroupType.from_config(group_config).value,
+                    "command": group_config.get("command", ""),
                     "metrics": OrderedDict()
                 }
                 
-                # Process metrics in sorted order
-                for metric_name in sorted(group_config.get("metrics", {}).keys()):
-                    metric_config = group_config["metrics"][metric_name]
-                    identifier = MetricIdentifier(
-                        service=service_name,
-                        group=group_name,
-                        name=metric_name,
-                        group_type=group_type,
-                        type=(MetricType.from_config(metric_config) if group_type == MetricGroupType.DYNAMIC else None),
-                        description=metric_config.get("description", "")
-                    )
-                    
-                    # Only include metrics that have been validated and are being collected
-                    if identifier in self.metrics_collector._prometheus_metrics:
-                        metric_info = OrderedDict([
-                            ("type", (identifier.type.value if identifier.type else "static")),
-                            ("description", metric_config.get("description", "")),
-                            ("prometheus_name", identifier.prometheus_name),
-                            ("settings", OrderedDict())
-                        ])
-                        
-                        if group_type == MetricGroupType.STATIC:
-                            metric_info["settings"]["value"] = metric_config.get("value")
-                        else:
-                            metric_info["settings"].update(OrderedDict([
-                                ("content_type", metric_config.get("content_type", "text")),
-                                ("filter", metric_config.get("filter"))
-                            ]))
-                        
-                        group_info["metrics"][metric_name] = metric_info
+                for metric_name in sorted(metrics.keys()):
+                    metric_config = metrics[metric_name]
+                    metric_info = OrderedDict([
+                        ("type", metric_config.get("type", "static")),
+                        ("description", metric_config.get("description", "")),
+                        ("prometheus_name", f"{service_name}_{group_name}_{metric_name}"),
+                        ("settings", OrderedDict([
+                            ("content_type", metric_config.get("content_type", "text")),
+                            ("filter", metric_config.get("filter", "")),
+                            ("transform", metric_config.get("transform", ""))
+                        ]))
+                    ])
+                    group_info["metrics"][metric_name] = metric_info
                 
-                if group_info["metrics"]:  # Only include groups with valid metrics
+                if group_info["metrics"]:
                     service_info["metric_groups"][group_name] = group_info
             
-            if service_info["metric_groups"]:  # Only include services with valid groups
+            if service_info["metric_groups"]:
                 metrics_info[service_name] = service_info
-        
+
         return metrics_info
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~

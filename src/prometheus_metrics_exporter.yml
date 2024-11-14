@@ -91,11 +91,11 @@ services:
                 # Group level labels identify this node instance
                 labels:
                     genesis_id:
-                        filter: "Genesis ID: (.+)$"
-                    genesis_hash: 
-                        filter: "Genesis hash: (.+)$"
+                        filter: "Genesis ID:\\s*([^\\n]+)"
+                    genesis_hash:
+                        filter: "Genesis hash:\\s*([^\\n]+)"
                     last_catchpoint:
-                        filter: "Last Catchpoint: (.+)$"
+                        filter: "Last Catchpoint:\\s*([^\\n]+)"
                 metrics:
                     sync_time_seconds:
                         type: "gauge"
