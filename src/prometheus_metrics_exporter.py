@@ -1154,43 +1154,69 @@ class MetricLabel:
     filter: Optional[str] = None
     content_type: str = "text"
 
-@dataclass(frozen=True, eq=True)
-class MetricIdentifier:
-    """Structured metric identifier."""
-    service: str
-    group: str
-    name: str
-    group_type: MetricGroupType
-    description: str
-    type: Optional[MetricType] = None
-    labels: tuple[MetricLabel, ...] = field(default_factory=tuple)
+    @dataclass(frozen=True, eq=True)
+    class MetricIdentifier:
+        """Structured metric identifier."""
+        service: str
+        group: str
+        name: str
+        group_type: MetricGroupType
+        description: str
+        type: Optional[MetricType] = None
+        labels: tuple[MetricLabel, ...] = field(default_factory=tuple)
 
-    def __hash__(self) -> int:
-        """Explicit hash implementation to ensure consistency."""
-        return hash((
-            self.service,
-            self.group, 
-            self.name,
-            self.group_type,
-            self.description,
-            self.type,
-            self.labels  # Already a tuple, so hashable
-        ))
+        def __hash__(self) -> int:
+            """Explicit hash implementation to ensure consistency with labels."""
+            # Convert labels to a stable format for hashing
+            label_tuples = tuple(
+                (label.name, label.value or '') 
+                for label in sorted(self.labels, key=lambda x: x.name)
+            )
+            
+            # Include labels in deterministic order
+            return hash((
+                self.service,
+                self.group, 
+                self.name,
+                self.group_type,
+                self.description,
+                self.type,
+                label_tuples  # Use processed label tuples instead of raw labels
+            ))
 
-    @property
-    def prometheus_name(self) -> str:
-        """Get prometheus-compatible metric name."""
-        return f"{self.service}_{self.group}_{self.name}"
+        @property
+        def prometheus_name(self) -> str:
+            """Get prometheus-compatible metric name."""
+            return f"{self.service}_{self.group}_{self.name}"
 
-    def get_label_dict(self) -> Dict[str, str]:
-        """Get labels as a dictionary for Prometheus.
-        
-        Returns:
-            Dictionary mapping label names to their values.
-            Values are guaranteed to be strings since they are converted
-            during label extraction.
-        """
-        return {label.name: label.value or '' for label in self.labels}
+        def get_label_dict(self) -> Dict[str, str]:
+            """Get labels as a dictionary for Prometheus.
+            
+            Returns:
+                Dictionary mapping label names to their values.
+                Values are guaranteed to be strings since they are converted
+                during label extraction.
+            """
+            # Sort labels for consistent ordering
+            sorted_labels = sorted(self.labels, key=lambda x: x.name)
+            return {label.name: (label.value or '') for label in sorted_labels}
+
+        def get_debug_info(self) -> str:
+            """Get detailed string representation for debugging."""
+            parts = [
+                f"name='{self.prometheus_name}'",
+                f"type={self.type.value if self.type else 'static'}",
+                f"group_type={self.group_type.value}"
+            ]
+            
+            if self.labels:
+                label_strs = [
+                    f"{label.name}='{label.value or ''}'"
+                    for label in sorted(self.labels, key=lambda x: x.name)
+                ]
+                parts.append(f"labels=[{', '.join(label_strs)}]")
+                
+            return f"MetricIdentifier({', '.join(parts)})"
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -2027,18 +2053,46 @@ class MetricsCollector:
     """Main metrics collector managing multiple services."""
     
     def __init__(self, config: ProgramConfig, logger: logging.Logger):
-            self.config = config
-            self.logger = logger
-            self.stats = CollectionStats()
-            self.service_collectors: Dict[str, ServiceMetricsCollector] = {}
-            self._prometheus_metrics: Dict[str, Union[Gauge, Counter]] = {}
-            self._previous_values: Dict[str, float] = {}
-            self.collection_manager = CollectionManager(config, logger)
-            
-            # Register for config reload notifications
-            self.config.register_reload_callback(self._reinitialize_collectors)
-            self._initialize_collectors()
-            self._setup_internal_metrics()
+        """Initialize metrics collector with enhanced metric storage.
+        
+        Args:
+            config: Program configuration
+            logger: Logger instance
+        """
+        self.config = config
+        self.logger = logger
+        self.stats = CollectionStats()
+        
+        # Service collectors
+        self.service_collectors: Dict[str, ServiceMetricsCollector] = {}
+        
+        # Metric storage with better typing
+        self._prometheus_metrics: Dict[str, Union[Gauge, Counter]] = {}
+        
+        # Store previous values with label-aware keys
+        # Key format: "metric_name{label1=value1,label2=value2}"
+        self._previous_values: Dict[str, float] = {}
+        
+        # Debug counters
+        self._metric_updates = 0
+        self._label_updates = 0
+        
+        self.collection_manager = CollectionManager(config, logger)
+        
+        # Register for config reload notifications
+        self.config.register_reload_callback(self._reinitialize_collectors)
+        
+        self.logger.verbose("Initializing metrics collector...")
+        self._initialize_collectors()
+        self._setup_internal_metrics()
+        
+        # Log initial state
+        self.logger.verbose(
+            "Metrics collector initialized:\n"
+            f"- Service collectors: {len(self.service_collectors)}\n"
+            f"- Prometheus metrics: {len(self._prometheus_metrics)}\n"
+            f"- Previous values: {len(self._previous_values)}"
+        )
     
     def _initialize_collectors(self):
         """Initialize collectors for each service."""
@@ -2087,34 +2141,65 @@ class MetricsCollector:
         self._initialize_collectors()    # Create new ones with updated config
 
     def _create_prometheus_metric(
-        self,
-        identifier: MetricIdentifier
-    ) -> Union[Gauge, Counter]:
-        """Create appropriate Prometheus metric based on identifier."""
-        # Get label names from identifier
-        label_names = [label.name for label in identifier.labels] if identifier.labels else []
-        self.logger.verbose(f"Creating metric {identifier.prometheus_name}")
-        self.logger.verbose(f"Type: {identifier.type if identifier.type else 'static'}")
-        self.logger.verbose(f"Label names: {label_names}")
-
-        if identifier.group_type == MetricGroupType.STATIC:
-            return Gauge(
-                identifier.prometheus_name,
-                identifier.description,
-                labelnames=label_names
-            )
-        elif identifier.type == MetricType.COUNTER:
-            return Counter(
-                identifier.prometheus_name,
-                identifier.description,
-                labelnames=label_names
-            )
-        else:
-            return Gauge(
-                identifier.prometheus_name,
-                identifier.description,
-                labelnames=label_names
-            )
+            self,
+            identifier: MetricIdentifier
+        ) -> Union[Gauge, Counter]:
+            """Create appropriate Prometheus metric based on identifier.
+            
+            Args:
+                identifier: Metric identifier containing all metric information
+                
+            Returns:
+                Prometheus metric object (Gauge or Counter) configured with labels
+                
+            Note:
+                Labels must be registered at creation time, even if values aren't set yet.
+            """
+            try:
+                # Debug log the full identifier
+                self.logger.verbose(f"\n=== Creating new Prometheus metric ===\n{identifier.get_debug_info()}")
+                
+                # Get and validate label names
+                label_names = []
+                if identifier.labels:
+                    label_names = [label.name for label in sorted(identifier.labels, key=lambda x: x.name)]
+                    self.logger.verbose(f"Registered label names: {label_names}")
+                
+                # Determine metric class and create instance
+                if identifier.group_type == MetricGroupType.STATIC:
+                    self.logger.verbose("Creating static Gauge metric")
+                    metric = Gauge(
+                        identifier.prometheus_name,
+                        identifier.description,
+                        labelnames=label_names
+                    )
+                elif identifier.type == MetricType.COUNTER:
+                    self.logger.verbose("Creating Counter metric")
+                    metric = Counter(
+                        identifier.prometheus_name,
+                        identifier.description,
+                        labelnames=label_names
+                    )
+                else:
+                    self.logger.verbose("Creating dynamic Gauge metric")
+                    metric = Gauge(
+                        identifier.prometheus_name,
+                        identifier.description,
+                        labelnames=label_names
+                    )
+                    
+                self.logger.verbose(
+                    f"Successfully created metric:\n"
+                    f"- Name: {identifier.prometheus_name}\n"
+                    f"- Type: {type(metric).__name__}\n"
+                    f"- Labels: {label_names}"
+                )
+                
+                return metric
+                
+            except Exception as e:
+                self.logger.error(f"Failed to create metric {identifier.prometheus_name}: {e}", exc_info=True)
+                raise
 
     def _get_metric_key(self, identifier: MetricIdentifier, labels: Optional[Dict[str, str]] = None) -> str:
         """Create unique metric key."""
@@ -2125,43 +2210,77 @@ class MetricsCollector:
             key = f"{key}_{label_str}"
         return key
 
-    def _update_prometheus_metrics(self, metrics: Dict[str, tuple[MetricIdentifier, float]]):
-        """Update Prometheus metrics with collected values."""
-        self.logger.verbose("\n=== Starting prometheus metrics update ===")
-        self.logger.verbose(f"Received {len(metrics)} metrics to update")
+def _update_prometheus_metrics(self, metrics: Dict[str, tuple[MetricIdentifier, float]]):
+    """Update Prometheus metrics with collected values."""
+    self.logger.verbose("\n=== Starting prometheus metrics update ===")
+    self.logger.verbose(f"Received {len(metrics)} metrics to update")
 
-        for key, (identifier, value) in sorted(metrics.items()):
-            try:
-                self.logger.verbose(f"\n--- Processing metric key: {key} ---")
-                
-                # Create metric if it doesn't exist
-                if key not in self._prometheus_metrics:
-                    label_names = [label.name for label in identifier.labels]
-                    self.logger.verbose(f"Creating new metric {key} with labels: {label_names}")
-                    metric = self._create_prometheus_metric(identifier)
-                    self._prometheus_metrics[key] = metric
+    for key, (identifier, value) in sorted(metrics.items()):
+        try:
+            metric_name = identifier.prometheus_name
+            self.logger.verbose(f"\n--- Processing metric: {identifier.get_debug_info()} ---")
+            
+            # Create or get base metric
+            if metric_name not in self._prometheus_metrics:
+                self.logger.verbose(f"Creating new metric {metric_name}")
+                metric = self._create_prometheus_metric(identifier)
+                self._prometheus_metrics[metric_name] = metric
+                self.logger.verbose("Metric created successfully")
+            else:
+                metric = self._prometheus_metrics[metric_name]
+                self.logger.verbose(f"Using existing metric {metric_name}")
 
-                metric = self._prometheus_metrics[key]
-                
-                if value is not None:
-                    # Apply labels if present
+            if value is not None:
+                try:
+                    labeled_metric = metric
+                    storage_key = key
+
+                    # Handle labels if present
                     if identifier.labels:
                         label_dict = identifier.get_label_dict()
-                        self.logger.verbose(f"Setting metric with labels: {label_dict}")
-                        metric = metric.labels(**label_dict)
+                        self.logger.verbose(f"Applying labels: {label_dict}")
+                        labeled_metric = metric.labels(**label_dict)
+                        # Create unique storage key for labeled metrics
+                        storage_key = f"{metric_name}{''.join(f'_{k}={v}' for k, v in sorted(label_dict.items()))}"
+                        self.logger.verbose(f"Using storage key: {storage_key}")
                     
                     # Update value
-                    self.logger.verbose(f"Setting value: {value}")
                     if isinstance(metric, Counter):
-                        prev_value = self._previous_values.get(key, 0)
+                        prev_value = self._previous_values.get(storage_key, 0)
                         if value > prev_value:
                             increment = value - prev_value
-                            metric.inc(increment)
-                        self._previous_values[key] = value
+                            self.logger.verbose(
+                                f"Incrementing counter:\n"
+                                f"- Previous: {prev_value}\n"
+                                f"- Current: {value}\n"
+                                f"- Increment: {increment}"
+                            )
+                            labeled_metric.inc(increment)
+                        self._previous_values[storage_key] = value
                     else:
-                        metric.set(value)
-            except Exception as e:
-                self.logger.error(f"Failed to update metric {key}: {e}")
+                        self.logger.verbose(f"Setting gauge value: {value}")
+                        labeled_metric.set(value)
+
+                    self.logger.verbose("Metric update completed successfully")
+
+                except Exception as e:
+                    self.logger.error(
+                        f"Failed to update metric value:\n"
+                        f"- Metric: {metric_name}\n"
+                        f"- Value: {value}\n"
+                        f"- Error: {e}",
+                        exc_info=True
+                    )
+            else:
+                self.logger.warning(f"Skipping update for {metric_name} - value is None")
+                
+        except Exception as e:
+            self.logger.error(
+                f"Failed to process metric:\n"
+                f"- Key: {key}\n"
+                f"- Error: {e}",
+                exc_info=True
+            )
 
     def _update_internal_metrics(self, successes: int, errors: int, duration: float):
         """Update internal metrics."""
