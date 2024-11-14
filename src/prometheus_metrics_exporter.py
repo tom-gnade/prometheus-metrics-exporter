@@ -1795,6 +1795,10 @@ class ServiceMetricsCollector:
                         convert_to_float=False  # Get raw value first
                     )
                     
+                    if raw_value is None:
+                        self.logger.warning(f"No value matched for metric {metric_name}")
+                        continue
+
                     self.logger.verbose(f"Raw value for {metric_name}: {raw_value}")
 
                     # Validate numeric value for prometheus
@@ -1802,8 +1806,7 @@ class ServiceMetricsCollector:
                         metric_value = float(raw_value) if raw_value is not None else None
                     except (TypeError, ValueError) as e:
                         self.logger.warning(
-                            f"Metric {metric_name} value '{raw_value}' "
-                            f"failed numeric validation: {e}"
+                            f"Metric {metric_name}: Could not convert value '{raw_value}' to number"
                         )
                         continue
 
@@ -1841,9 +1844,10 @@ class ServiceMetricsCollector:
 
             return results
                 
+        except MetricValidationError as e:
+            self.logger.warning(f"Failed to collect metric {metric_name}: {e}")
         except Exception as e:
-            self.logger.error(f"Failed to collect group {group_name}: {e}")
-            return {}
+            self.logger.error(f"Unexpected error collecting metric {metric_name}: {e}")
     
     # Modify _parse_metric_value:
     def _parse_metric_value(
