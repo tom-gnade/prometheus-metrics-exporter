@@ -1751,11 +1751,17 @@ class ServiceMetricsCollector:
             )
 
             # Extract group-level labels first
-            group_labels = self._extract_label_values(
-                group_config.get('labels', {}),
-                output,
-                group_content_type
-            )
+            group_labels = []
+            if 'labels' in group_config:
+                self.logger.verbose("\n=== Processing group-level labels ===")
+                self.logger.verbose(f"Group label config: {json.dumps(group_config['labels'], indent=2)}")
+                extracted_labels = self._extract_label_values(
+                    group_config['labels'],
+                    output,
+                    group_content_type
+                )
+                group_labels = list(extracted_labels)  # Convert tuple to list for manipulation
+                self.logger.verbose(f"Extracted group labels: {group_labels}")
 
             # Process each metric
             failed_metrics = []
@@ -1834,11 +1840,23 @@ class ServiceMetricsCollector:
                             continue
 
                         # Extract metric-specific labels
-                        metric_labels = self._extract_label_values(
-                            metric_config.get('labels', {}),
-                            output,
-                            group_content_type
-                        )
+                        metric_labels = []
+                        if 'labels' in metric_config:
+                            self.logger.verbose(f"\n=== Processing metric-level labels for {metric_name} ===")
+                            self.logger.verbose(f"Metric label config: {json.dumps(metric_config['labels'], indent=2)}")
+                            extracted_labels = self._extract_label_values(
+                                metric_config['labels'],
+                                output,
+                                group_content_type
+                            )
+                            metric_labels = list(extracted_labels)
+                            self.logger.verbose(f"Extracted metric labels: {metric_labels}")
+
+                        # Combine group and metric labels
+                        combined_labels = []
+                        combined_labels.extend(group_labels)
+                        combined_labels.extend(metric_labels)
+                        self.logger.verbose(f"Combined labels for {metric_name}: {combined_labels}")
 
                         # Create identifier with all labels
                         identifier = MetricIdentifier(
@@ -1848,7 +1866,7 @@ class ServiceMetricsCollector:
                             group_type=MetricGroupType.DYNAMIC,
                             type=metric_type,
                             description=metric_config['description'],
-                            labels=group_labels + metric_labels
+                            labels=tuple(combined_labels)
                         )
 
                         key = f"{self.service_name}_{group_name}_{metric_name}"
