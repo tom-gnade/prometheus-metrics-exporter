@@ -1,0 +1,93 @@
+# Exporter Configuration (optional)
+exporter:
+    metrics_port: 9101
+    health_port: 9102
+    collection:
+        poll_interval_sec: 5 # Global polling interval
+    logging:
+        console_level: "DEBUG"
+
+# Services Configuration (required)
+services:
+    algorand_node:
+        description: "Algorand node services in Docker container"
+        run_as: prometheus  # Run as prometheus user, using sudo for docker commands
+        metric_groups:
+            node_status:
+                command: "sudo docker exec algomon-algonode goal node status -d /var/lib/algorand"
+                description: "Algorand node status metrics"
+                # Group level labels identify this node instance
+                labels:
+                    genesis_id:
+                        filter: "(?m)^Genesis ID: (.+?)$"
+                    genesis_hash:
+                        filter: "(?m)^Genesis hash: (.+?)$"
+                    last_catchpoint:
+                        filter: "(?m)^Last Catchpoint: (.+?)$"
+                metrics:
+                    sync_time_seconds:
+                        type: "gauge"
+                        description: "Node synchronization time in seconds"
+                        filter: "(?m)^Sync Time: ([0-9.]+)s"
+                    last_block_age_seconds:
+                        type: "gauge" 
+                        description: "Time since last block in seconds"
+                        filter: "(?m)^Time since last block: ([0-9.]+)s"
+                    last_committed_round:
+                        type: "gauge"
+                        description: "Last committed round number"
+                        filter: "(?m)^Last committed block: ([0-9]+)"
+                    next_consensus_round:
+                        type: "gauge"
+                        description: "Round number for next consensus protocol"
+                        filter: "(?m)^Round for next consensus protocol: ([0-9]+)"
+                    consensus_upgrade_ready:
+                        type: "gauge"
+                        description: "Whether next consensus protocol is supported (1=true, 0=false)"
+                        filter: "(?m)^Next consensus protocol supported: (true|false)"
+                        transform: "value.lower() == 'true' and 1 or 0"
+                        labels:
+                            next_protocol:
+                                filter: "(?m)^Next consensus protocol: (.+)$"
+                            current_protocol:
+                                filter: "(?m)^Last consensus protocol: (.+)$"
+            process_stats:
+                command: "sudo docker stats algomon-algonode --no-stream --format '{{.CPUPerc}};{{.MemUsage}};{{.MemPerc}};{{.NetIO}};{{.BlockIO}};{{.PIDs}}'"
+                description: "Algorand container metrics from Docker"
+                metrics:
+                    cpu_percent:
+                        type: "gauge"
+                        description: "CPU usage percentage"
+                        filter: "^([0-9.]+)%;.*"
+                    memory_bytes:
+                        type: "gauge"
+                        description: "Current memory usage in bytes"
+                        filter: ".*;([0-9.]+[GMK]?iB) / .*"
+                    memory_percent:
+                        type: "gauge"
+                        description: "Memory usage percentage"
+                        filter: ".*;.*;([0-9.]+)%;.*"
+                    pids:
+                        type: "gauge"
+                        description: "Number of processes in container"
+                        filter: ".*;.*;.*;.*;.*;([0-9]+)"
+            api_health:
+                command: "sudo docker exec algomon-algonode curl -so /dev/null -w '%{http_code}' http://localhost:8080/health"
+                description: "Algorand API health check"
+                metrics:
+                    up:
+                        type: "gauge"
+                        description: "Whether the API health check succeeded (1=healthy, 0=unhealthy)"
+                        filter: "^([0-9]+)$"
+                        transform: "value == '200' and 1 or 0" 
+            data_store:
+                command: "sudo docker exec algomon-algonode du -sb /var/lib/algorand"
+                description: "Algorand data directory size in container"
+                labels:
+                    data_dir:
+                        filter: "^[0-9]+\\s+(.+)$"
+                metrics:
+                    bytes_total:
+                        type: "gauge"
+                        description: "Total size of algorand data directory in bytes"
+                        filter: "^([0-9]+)"
