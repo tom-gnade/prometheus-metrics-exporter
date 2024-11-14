@@ -114,6 +114,7 @@ Notes:
 import asyncio
 import json
 import logging
+import inspect
 import os
 import pwd
 import grp
@@ -146,6 +147,13 @@ from prometheus_client import (
 from cysystemd.daemon import notify, Notification
 from cysystemd import journal
 import yaml
+
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+# Global Configuration
+#-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
+
+# Enable/disable verbose debug logging
+VERBOSE_DEBUG = True
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 # Core Exceptions
@@ -505,9 +513,41 @@ class ProgramConfig:
         group_type = MetricGroupType.from_config(group_config)
         self.logger.verbose(f"Group type determined as: {group_type.value}")
         validated['type'] = group_type.value
+
+        # Get group content type and validate filters (for dynamic groups only)
+        if group_type == MetricGroupType.DYNAMIC:
+            content_type = ContentType(group_config.get('content_type', 'text'))
+            self.logger.verbose(f"Group content type: {content_type.value}")
+
+            # Validate group-level labels if present
+            if 'labels' in group_config:
+                for label_name, label_config in group_config['labels'].items():
+                    if not content_type.validate_filter(label_config['filter']):
+                        raise MetricConfigurationError(
+                            f"Invalid filter format for {content_type.value} content type "
+                            f"in group label '{label_name}': {label_config['filter']}"
+                        )
+
+            # Pre-validate all metric filters before detailed processing
+            for metric_name, metric_config in group_config.get('metrics', {}).items():
+                if 'filter' in metric_config:
+                    if not content_type.validate_filter(metric_config['filter']):
+                        raise MetricConfigurationError(
+                            f"Invalid filter format for {content_type.value} content type "
+                            f"in metric '{metric_name}': {metric_config['filter']}"
+                        )
+                        
+                # Check metric labels too
+                if 'labels' in metric_config:
+                    for label_name, label_config in metric_config['labels'].items():
+                        if not content_type.validate_filter(label_config['filter']):
+                            raise MetricConfigurationError(
+                                f"Invalid filter format for {content_type.value} content type "
+                                f"in metric '{metric_name}' label '{label_name}': {label_config['filter']}"
+                            )
         
+        # Process static metrics
         if group_type == MetricGroupType.STATIC:
-            # Validate static metrics
             metrics_count = len(group_config.get('metrics', {}))
             self.logger.verbose(f"Found {metrics_count} static metrics to validate")
             
@@ -590,7 +630,7 @@ class ProgramConfig:
                                 raise MetricConfigurationError(f"Label {label_name} must specify a filter")
                             validated_labels[label_name] = {
                                 'filter': label_config['filter'],
-                                'content_type': label_config.get('content_type', 'text')
+                                'content_type': content_type.value  # Use group's content type
                             }
                             self.logger.verbose(f"Label {label_name} validated successfully")
                         validated_metric['labels'] = validated_labels
@@ -598,10 +638,9 @@ class ProgramConfig:
                     else:
                         self.logger.verbose("No labels found for this metric")
                     
-                    # Copy optional content_type if present
-                    if 'content_type' in metric_config:
-                        validated_metric['content_type'] = metric_config['content_type']
-                        self.logger.verbose(f"Added content_type: {metric_config['content_type']}")
+                    # Store content type from group level
+                    validated_metric['content_type'] = content_type.value
+                    self.logger.verbose(f"Using group content type: {content_type.value}")
                     
                     validated['metrics'][metric_name] = validated_metric
                     self.logger.verbose(f"Final validated metric: {json.dumps(validated_metric, indent=2)}")
@@ -824,11 +863,10 @@ class ProgramLogger:
     """Manages logging configuration and setup."""
     
     # Verbose logging config
-    VERBOSE_DEBUG = True
-    VERBOSE_LEVEL = 15  # DEBUG 10, INFO 20
+    VERBOSE_LEVEL = 15  # Between DEBUG (10) and INFO (20)
 
     class VerboseLogger(logging.Logger):
-        """Enhanced Logger class adding verbose debugging capabilities"""
+        """Enhanced Logger class adding verbose debugging capabilities."""
 
         def verbose(
             self,
@@ -836,36 +874,46 @@ class ProgramLogger:
             *args: Any,
             **kwargs: Any
         ) -> None:
-            """Log verbose debug messages with efficient deferred evaluation."""
-
-            if not ProgramLogger.VERBOSE_DEBUG:
+            """Log verbose debug messages with caller context."""
+            if not VERBOSE_DEBUG:
                 return
 
-            # Handle deferred evaluation of expensive computations
-            if callable(msg):
-                if args or kwargs:
-                    self.log(ProgramLogger.VERBOSE_LEVEL, msg(*args, **kwargs))
-                else:
-                    self.log(ProgramLogger.VERBOSE_LEVEL, msg())
-            # Handle string formatting
-            elif args or kwargs:
-                self.log(ProgramLogger.VERBOSE_LEVEL, msg.format(*args, **kwargs))
-            # Handle simple strings
-            else:
-                self.log(ProgramLogger.VERBOSE_LEVEL, msg)
+            try:
+                # Get caller's context
+                frame = inspect.currentframe()
+                if frame and frame.f_back:
+                    caller_frame = frame.f_back
+                    module_name = caller_frame.f_globals.get('__name__', '')
+                    function_name = caller_frame.f_code.co_name
+                    line_no = caller_frame.f_lineno
+                    
+                    # Format caller context with line number
+                    kwargs['extra'] = {
+                        'name': f"{module_name}.{function_name}({line_no:d})"
+                    }
+                    
+                    # Handle message
+                    if callable(msg):
+                        self.log(ProgramLogger.VERBOSE_LEVEL,
+                                msg(*args) if args else msg(), 
+                                **kwargs)
+                    else:
+                        self.log(ProgramLogger.VERBOSE_LEVEL,
+                                msg.format(*args) if args else msg, 
+                                **kwargs)
+                        
+            except Exception as e:
+                # Fallback to basic logging if context extraction fails
+                self.warning(f"Failed to get caller context: {e}")
+                super().verbose(msg, *args, **kwargs)
+                
+            finally:
+                # Clean up frame references
+                if frame:
+                    del frame
 
-    def __init__(
-        self,
-        source: ProgramSource,
-        config: ProgramConfig
-    ):
-        """Initialize logging configuration.
-        
-        Args:
-            source: Program source information
-            config: Program configuration
-        """
-
+    def __init__(self, source: ProgramSource, config: ProgramConfig):
+        """Initialize logging configuration."""
         # Set VerboseLogger as the default logger class
         logging.addLevelName(self.VERBOSE_LEVEL, 'VERBOSE')
         logging.setLoggerClass(self.VerboseLogger)
@@ -1140,8 +1188,20 @@ class MetricIdentifier:
     name: str
     group_type: MetricGroupType
     description: str
-    type: Optional[MetricType] = None  # Optional because static metrics don't need a type
-    labels: tuple[MetricLabel, ...] = field(default_factory=tuple)  # Changed from List to Tuple
+    type: Optional[MetricType] = None
+    labels: tuple[MetricLabel, ...] = field(default_factory=tuple)
+
+    def __hash__(self) -> int:
+        """Explicit hash implementation to ensure consistency."""
+        return hash((
+            self.service,
+            self.group, 
+            self.name,
+            self.group_type,
+            self.description,
+            self.type,
+            self.labels  # Already a tuple, so hashable
+        ))
 
     @property
     def prometheus_name(self) -> str:
@@ -1149,8 +1209,14 @@ class MetricIdentifier:
         return f"{self.service}_{self.group}_{self.name}"
 
     def get_label_dict(self) -> Dict[str, str]:
-        """Get labels as a dictionary for Prometheus."""
-        return {label.name: (label.value or '') for label in self.labels}
+        """Get labels as a dictionary for Prometheus.
+        
+        Returns:
+            Dictionary mapping label names to their values.
+            Values are guaranteed to be strings since they are converted
+            during label extraction.
+        """
+        return {label.name: label.value or '' for label in self.labels}
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -1159,8 +1225,27 @@ class ContentType(Enum):
     TEXT = "text" # Use regex pattern matching
     JSON = "json" # Use jq-style path filtering
     
+    def validate_filter(self, filter_expr: str) -> bool:
+        """Validate filter expression matches content type."""
+        if self == ContentType.TEXT:
+            try:
+                re.compile(filter_expr)
+                return True
+            except re.error:
+                return False
+        elif self == ContentType.JSON:
+            # jq-style path should be dot-separated keys
+            return bool(re.match(r'^\.?[\w]+(\.[\w]+)*$', filter_expr))
+        return False
+
     def parse_value(self, content: str, filter_expr: str, logger: logging.Logger, convert_to_float: bool = True) -> Optional[Union[float, str]]:
         """Parse content based on content type."""
+        # Validate filter format first
+        if not self.validate_filter(filter_expr):
+            raise MetricValidationError(
+                f"Invalid filter format '{filter_expr}' for content type {self.value}"
+            )
+
         try:
             if self == ContentType.TEXT:
                 logger.verbose(f"Attempting TEXT match with pattern: {filter_expr}")
@@ -1679,85 +1764,105 @@ class ServiceMetricsCollector:
         group_name: str,
         group_config: Dict
     ) -> Dict[str, tuple[MetricIdentifier, float]]:
-        """Collect metrics for a dynamic group."""
-        self.logger.verbose(f"=== Starting collection for group {group_name} ===")
-        self.logger.verbose(f"Full group config: {json.dumps(group_config, indent=2)}")
-        results = {}
+        """Collect metrics for a dynamic group.
         
+        A single command execution provides output that is parsed based on the 
+        group's content type. All metrics and labels use the same content type
+        and parse from the same command output.
+        """
+        self.logger.verbose(f"=== Starting collection for group {group_name} ===")
+        results = {}
+
         try:
-            # Execute command for dynamic metrics
+            # 1. Execute group command once
             command = group_config['command']
-            self.logger.verbose(f"Executing command: {command}")
-            result = await self.command_executor.execute_command(command, self.user_context)
-            self.logger.verbose(f"Command execution result: {result.output}")
+            command_result = await self.command_executor.execute_command(
+                command, 
+                self.user_context
+            )
             
-            if not result.success:
-                self.logger.error(f"Command failed: {result.error_message}")
+            if not command_result.success:
+                self.logger.error(f"Group command failed: {command_result.error_message}")
                 return results
 
-            # Parse metrics from command output
+            # 2. Get group content type for all parsing
+            output = command_result.output
+            group_content_type = ContentType(group_config.get('content_type', 'text'))
+            self.logger.verbose(f"Using group content type: {group_content_type.value}")
+
+            # 3. Extract group-level labels using group content type
+            group_labels = self._extract_label_values(
+                group_config.get('labels', {}),
+                output,
+                group_content_type  # Pass group's content type
+            )
+
+            # 4. Process each metric using same output and content type
             for metric_name, metric_config in group_config.get('metrics', {}).items():
                 try:
-                    self.logger.verbose(f"Processing metric {metric_name}")
-                    self.logger.verbose(f"Full metric config: {json.dumps(metric_config, indent=2)}")
-                    
+                    # Validate metric type first
+                    if 'type' not in metric_config:
+                        self.logger.error(f"Metric {metric_name} missing required type field")
+                        continue
+
                     metric_type = MetricType.from_config(metric_config)
-                    self.logger.verbose(f"Metric type: {metric_type}")
 
-                    # Detail label processing
-                    self.logger.verbose("Checking for labels...")
-                    if 'labels' in metric_config:
-                        self.logger.verbose(f"Found labels config: {json.dumps(metric_config['labels'], indent=2)}")
-                        for label_name, label_config in metric_config['labels'].items():
-                            self.logger.verbose(f"Processing label '{label_name}' with config: {label_config}")
-                            self.logger.verbose(f"Label filter: {label_config['filter']}")
-
-                    # Extract label values if present
-                    labels = []
-                    if 'labels' in metric_config:
-                        self.logger.verbose("Starting label value extraction...")
-                        labels = tuple(self._extract_label_values(result.output, metric_config['labels'])) if 'labels' in metric_config else ()
-                        self.logger.verbose(f"Extracted labels: {[{'name': l.name, 'value': l.value, 'filter': l.filter} for l in labels]}")
-                    else:
-                        self.logger.verbose("No labels defined for this metric")
-
-                    self.logger.verbose("Creating MetricIdentifier...")
-                    identifier = MetricIdentifier(
-                        service = self.service_name,
-                        group = group_name,
-                        name = metric_name,
-                        group_type = MetricGroupType.DYNAMIC,
-                        type = metric_type,
-                        description = metric_config['description'],
-                        labels = labels
+                    # Extract raw value using group content type - ignore metric's content_type
+                    raw_value = group_content_type.parse_value(
+                        output,
+                        metric_config['filter'],
+                        self.logger,
+                        convert_to_float=False  # Get raw value first
                     )
-                    self.logger.verbose(f"Created identifier: {identifier}")
-                    self.logger.verbose(f"Identifier labels: {[{'name': l.name, 'value': l.value} for l in identifier.labels]}")
                     
-                    value = self._parse_metric_value(result.output, metric_config, metric_type)
-                    self.logger.verbose(f"Parsed value for {metric_name}: {value}")
+                    self.logger.verbose(f"Raw value for {metric_name}: {raw_value}")
+
+                    # Validate numeric value for prometheus
+                    try:
+                        metric_value = float(raw_value) if raw_value is not None else None
+                    except (TypeError, ValueError) as e:
+                        self.logger.warning(
+                            f"Metric {metric_name} value '{raw_value}' "
+                            f"failed numeric validation: {e}"
+                        )
+                        continue
+
+                    if metric_value is None:
+                        self.logger.warning(f"Null value for metric {metric_name}")
+                        continue
+
+                    # Extract metric labels using group content type
+                    metric_labels = self._extract_label_values(
+                        metric_config.get('labels', {}),
+                        output,
+                        group_content_type  # Use group's content type
+                    )
+
+                    # Create identifier
+                    identifier = MetricIdentifier(
+                        service=self.service_name,
+                        group=group_name,
+                        name=metric_name,
+                        group_type=MetricGroupType.DYNAMIC,
+                        type=metric_type,
+                        description=metric_config['description'],
+                        labels=group_labels + metric_labels
+                    )
+
+                    key = f"{self.service_name}_{group_name}_{metric_name}"
+                    results[key] = (identifier, metric_value)
                     
-                    if value is not None:
-                        # Use metric name as key
-                        key = f"{self.service_name}_{group_name}_{metric_name}"
-                        self.logger.verbose(f"Using key: {key}")
-                        results[key] = (identifier, value)
-                        self.logger.verbose(f"Added to results with identifier hash: {hash(identifier)}")
-                        
                 except Exception as e:
-                    self.logger.error(f"Failed to collect metric {metric_name}: {e}", exc_info=True)
-            
-            self.logger.verbose(f"\n=== Group collection results ===")
-            for k, (i, v) in results.items():
-                self.logger.verbose(f"Key: {k}")
-                self.logger.verbose(f"Identifier: {i}")
-                self.logger.verbose(f"Value: {v}")
-                self.logger.verbose(f"Labels: {[{'name': l.name, 'value': l.value} for l in i.labels]}")
+                    self.logger.error(
+                        f"Failed to process metric {metric_name}: {e}",
+                        exc_info=True
+                    )
+                    continue
 
             return results
                 
         except Exception as e:
-            self.logger.error(f"Failed to collect group {group_name}: {e}", exc_info=True)
+            self.logger.error(f"Failed to collect group {group_name}: {e}")
             return {}
     
     def _parse_metric_value(
@@ -1804,49 +1909,44 @@ class ServiceMetricsCollector:
 
     def _extract_label_values(
         self,
-        source_data: str,
-        label_configs: Dict[str, Dict[str, Any]]
-    ) -> List[MetricLabel]:
+        label_definitions: Dict[str, Dict],
+        output: str,
+        content_type: ContentType
+    ) -> tuple[MetricLabel, ...]:
         """Extract label values from command output."""
-        self.logger.verbose(f"=== Starting label extraction ===")
-        self.logger.verbose(f"Label configs to process: {json.dumps(label_configs, indent=2)}")
-        self.logger.verbose(f"Source data for extraction:\n{source_data}")
-        
-        labels = []
-        for label_name, label_config in label_configs.items():
-            try:
-                self.logger.verbose(f"\nProcessing label '{label_name}'")
-                self.logger.verbose(f"Label config: {json.dumps(label_config, indent=2)}")
-                
-                content_type = ContentType(label_config.get('content_type', 'text'))
-                self.logger.verbose(f"Using content type: {content_type.value}")
-                
-                value = content_type.parse_value(
-                    source_data,
-                    label_config['filter'],
-                    self.logger,
-                    convert_to_float=False  # Labels should remain as strings
-                )
-                self.logger.verbose(f"Extracted value: {value}")
+        if not label_definitions:
+            return tuple()
 
-                # Value is already a string since convert_to_float=False
-                label = MetricLabel(
-                    name=label_name,
-                    value=value,
-                    filter=label_config['filter'],
-                    content_type=label_config.get('content_type', 'text')
+        # Pre-calculate tuple size
+        label_count = len(label_definitions)
+        labels_list = [None] * label_count  # Pre-allocate list
+        
+        for idx, (label_name, config) in enumerate(sorted(label_definitions.items())):
+            try:
+                raw_value = content_type.parse_value(
+                    output,
+                    config['filter'],
+                    self.logger,
+                    convert_to_float=False
                 )
-                self.logger.verbose(f"Created label: {label}")
-                labels.append(label)
+                
+                if raw_value is None or str(raw_value).strip() == '':
+                    self.logger.warning(
+                        f"Label '{label_name}' filter produced no value - "
+                        f"filter may be incorrect: {config['filter']}"
+                    )
+                
+                labels_list[idx] = MetricLabel(
+                    name=label_name,
+                    value=str(raw_value) if raw_value is not None else "",
+                    filter=config['filter']
+                )
                 
             except Exception as e:
-                self.logger.warning(f"Failed to extract label {label_name}: {e}")
-                self.logger.verbose(f"Exception details:", exc_info=True)
-                self.logger.verbose(f"Adding empty label for {label_name}")
-                labels.append(MetricLabel(name=label_name))
-        
-        self.logger.verbose(f"\nFinal extracted labels: {[{'name': l.name, 'value': l.value} for l in labels]}")
-        return tuple(labels)  # Convert to tuple for immutability
+                self.logger.warning(f"Failed to extract value for label '{label_name}': {e}")
+                labels_list[idx] = MetricLabel(name=label_name)
+
+        return tuple(labels_list)
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
@@ -1957,59 +2057,45 @@ class MetricsCollector:
         self.logger.verbose("\n=== Starting prometheus metrics update ===")
         self.logger.verbose(f"Received {len(metrics)} metrics to update")
 
-        # Sort metrics by key
+        # Sort metrics by key for consistent updates
         sorted_metrics = sorted(metrics.items())
-        self.logger.verbose(f"Sorted metrics keys: {[k for k, _ in sorted_metrics]}")
         
         for key, (identifier, value) in sorted_metrics:
             try:
                 self.logger.verbose(f"\n--- Processing metric key: {key} ---")
                 metric_name = identifier.prometheus_name
-                self.logger.verbose(f"Prometheus name: {metric_name}")
-                self.logger.verbose(f"Identifier details: {identifier}")
-                self.logger.verbose(f"Value: {value}")
-                self.logger.verbose(f"Labels present: {bool(identifier.labels)}")
-                if identifier.labels:
-                    self.logger.verbose(f"Label details: {[{'name': l.name, 'value': l.value} for l in identifier.labels]}")
-
+                
                 # Create metric if it doesn't exist
                 if key not in self._prometheus_metrics:
                     self.logger.verbose(f"Creating new prometheus metric for {key}")
-                    self.logger.verbose(f"Label names: {[l.name for l in identifier.labels]}")
                     metric = self._create_prometheus_metric(identifier)
                     self._prometheus_metrics[key] = metric
                     self.logger.verbose(f"Created new metric with type: {type(metric)}")
                 else:
-                    self.logger.verbose(f"Using existing metric for {key}")
+                    metric = self._prometheus_metrics[key]
                 
                 if value is not None:
-                    metric = self._prometheus_metrics[key]
-                    self.logger.verbose(f"Base metric type: {type(metric)}")
-
                     # Get the metric with labels if they exist
                     if identifier.labels:
-                        label_values = {label.name: label.value for label in identifier.labels}
+                        label_values = identifier.get_label_dict()  # Use the method for proper None handling
                         self.logger.verbose(f"Applying labels: {label_values}")
                         metric = metric.labels(**label_values)
-                        self.logger.verbose(f"Labeled metric type: {type(metric)}")
-
+                    
                     # Update the metric value
                     if isinstance(metric, Counter):
                         prev_value = self._previous_values.get(key, 0)
-                        self.logger.verbose(f"Counter previous value: {prev_value}")
                         if value > prev_value:
                             increment = value - prev_value
-                            self.logger.verbose(f"Incrementing by: {increment}")
                             metric.inc(increment)
                         self._previous_values[key] = value
                     else:  # Gauge
-                        self.logger.verbose(f"Setting gauge value to: {value}")
                         metric.set(value)
-                        
-                    self.logger.verbose("Metric update completed successfully")
 
             except Exception as e:
-                self.logger.error(f"Failed to update metric {identifier.prometheus_name}: {e}", exc_info=True)
+                self.logger.error(
+                    f"Failed to update metric {identifier.prometheus_name}: {e}",
+                    exc_info=True
+                )
 
     def _update_internal_metrics(self, successes: int, errors: int, duration: float):
         """Update internal metrics."""
@@ -2043,12 +2129,22 @@ class MetricsCollector:
             # Process results from each service
             for service_name, metrics in service_results.items():
                 self.logger.verbose(f"Processing results for service {service_name}: {metrics}")
-                if isinstance(metrics, Dict) and metrics:
-                    success_count += len(metrics)
-                    # Update Prometheus metrics with the collected values
-                    self._update_prometheus_metrics(metrics)
+                if isinstance(metrics, Dict):
+                    # Track success/failure for each individual metric
+                    for metric_key, metric_result in metrics.items():
+                        try:
+                            if metric_result is None or isinstance(metric_result, Exception):
+                                self.logger.error(f"Failed to collect metric {metric_key}: {metric_result}")
+                                errors += 1
+                            else:
+                                # Update Prometheus metrics with the collected values
+                                self._update_prometheus_metrics({metric_key: metric_result})
+                                success_count += 1
+                        except Exception as e:
+                            self.logger.error(f"Failed to process metric {metric_key}: {e}")
+                            errors += 1
                 else:
-                    self.logger.error(f"Failed to collect metrics for {service_name}")
+                    self.logger.error(f"Failed to collect any metrics for service {service_name}")
                     errors += 1
             
             # Debug log final metrics state
@@ -2277,7 +2373,7 @@ class HealthCheck:
                 start_response('500 Internal Server Error', [('Content-Type', 'application/json')])
                 return [self._create_error_response("error", str(e))]
 
-            return app
+        return app
     
     def _get_metrics_inventory(self) -> Dict[str, Any]:
         """Get metrics inventory with collection status."""
