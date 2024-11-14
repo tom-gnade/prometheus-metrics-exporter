@@ -2099,8 +2099,6 @@ class MetricsCollector:
                     f"Failed to initialize collector for {service_name}: {e}"
                 )
 
-
-
     def _setup_internal_metrics(self):
         """Set up internal metrics tracking."""
         self._internal_metrics = {
@@ -2209,36 +2207,30 @@ class MetricsCollector:
 
         for key, (identifier, value) in sorted(metrics.items()):
             try:
-                metric_name = identifier.prometheus_name
-                self.logger.verbose(f"\n--- Processing metric: {identifier.get_debug_info()} ---")
+                self.logger.verbose(f"\n--- Processing metric {identifier.get_debug_info()} ---")
+                self.logger.verbose(f"Using storage key: {key}")
                 
-                # Create or get base metric
-                if metric_name not in self._prometheus_metrics:
-                    self.logger.verbose(f"Creating new metric {metric_name}")
+                # Create metric if it doesn't exist
+                if key not in self._prometheus_metrics:
+                    label_names = [label.name for label in identifier.labels]
+                    self.logger.verbose(f"Creating new metric {key} with labels: {label_names}")
                     metric = self._create_prometheus_metric(identifier)
-                    self._prometheus_metrics[metric_name] = metric
-                    self.logger.verbose("Metric created successfully")
+                    self._prometheus_metrics[key] = metric
                 else:
-                    metric = self._prometheus_metrics[metric_name]
-                    self.logger.verbose(f"Using existing metric {metric_name}")
+                    metric = self._prometheus_metrics[key]
+                    self.logger.verbose(f"Using existing metric {key}")
 
                 if value is not None:
                     try:
-                        labeled_metric = metric
-                        storage_key = key
-
-                        # Handle labels if present
+                        # Apply labels if present
                         if identifier.labels:
                             label_dict = identifier.get_label_dict()
                             self.logger.verbose(f"Applying labels: {label_dict}")
-                            labeled_metric = metric.labels(**label_dict)
-                            # Create unique storage key for labeled metrics
-                            storage_key = f"{metric_name}{''.join(f'_{k}={v}' for k, v in sorted(label_dict.items()))}"
-                            self.logger.verbose(f"Using storage key: {storage_key}")
+                            metric = metric.labels(**label_dict)
                         
                         # Update value
                         if isinstance(metric, Counter):
-                            prev_value = self._previous_values.get(storage_key, 0)
+                            prev_value = self._previous_values.get(key, 0)
                             if value > prev_value:
                                 increment = value - prev_value
                                 self.logger.verbose(
@@ -2247,24 +2239,24 @@ class MetricsCollector:
                                     f"- Current: {value}\n"
                                     f"- Increment: {increment}"
                                 )
-                                labeled_metric.inc(increment)
-                            self._previous_values[storage_key] = value
+                                metric.inc(increment)
+                            self._previous_values[key] = value
                         else:
                             self.logger.verbose(f"Setting gauge value: {value}")
-                            labeled_metric.set(value)
-
+                            metric.set(value)
+                            
                         self.logger.verbose("Metric update completed successfully")
 
                     except Exception as e:
                         self.logger.error(
                             f"Failed to update metric value:\n"
-                            f"- Metric: {metric_name}\n"
+                            f"- Metric: {key}\n"
                             f"- Value: {value}\n"
                             f"- Error: {e}",
                             exc_info=True
                         )
                 else:
-                    self.logger.warning(f"Skipping update for {metric_name} - value is None")
+                    self.logger.warning(f"Skipping update for {key} - value is None")
                     
             except Exception as e:
                 self.logger.error(
