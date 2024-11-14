@@ -1141,7 +1141,7 @@ class MetricIdentifier:
     group_type: MetricGroupType
     description: str
     type: Optional[MetricType] = None  # Optional because static metrics don't need a type
-    labels: Tuple[MetricLabel, ...] = field(default_factory=tuple)  # Changed from List to Tuple
+    labels: tuple[MetricLabel, ...] = field(default_factory=tuple)  # Changed from List to Tuple
 
     @property
     def prometheus_name(self) -> str:
