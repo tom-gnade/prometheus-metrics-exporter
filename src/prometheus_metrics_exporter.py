@@ -2205,11 +2205,14 @@ class MetricsCollector:
         self.logger.verbose("\n=== Starting prometheus metrics update ===")
         self.logger.verbose(f"Received {len(metrics)} metrics to update")
 
+        # Log current storage state for debugging
+        self.logger.verbose(f"Current storage keys: {list(self._prometheus_metrics.keys())}")
+
         for key, (identifier, value) in sorted(metrics.items()):
             try:
                 self.logger.verbose(f"\n--- Processing metric {identifier.get_debug_info()} ---")
                 self.logger.verbose(f"Using storage key: {key}")
-                
+                    
                 # Create metric if it doesn't exist
                 if key not in self._prometheus_metrics:
                     label_names = [label.name for label in identifier.labels]
@@ -2227,7 +2230,7 @@ class MetricsCollector:
                             label_dict = identifier.get_label_dict()
                             self.logger.verbose(f"Applying labels: {label_dict}")
                             metric = metric.labels(**label_dict)
-                        
+                            
                         # Update value
                         if isinstance(metric, Counter):
                             prev_value = self._previous_values.get(key, 0)
@@ -2244,20 +2247,23 @@ class MetricsCollector:
                         else:
                             self.logger.verbose(f"Setting gauge value: {value}")
                             metric.set(value)
-                            
+                                
                         self.logger.verbose("Metric update completed successfully")
 
                     except Exception as e:
                         self.logger.error(
                             f"Failed to update metric value:\n"
                             f"- Metric: {key}\n"
+                            f"- Labels: {identifier.get_label_dict() if identifier.labels else 'none'}\n"
                             f"- Value: {value}\n"
                             f"- Error: {e}",
                             exc_info=True
                         )
+                    else:
+                        self.logger.verbose(f"Successfully updated metric {key}")
                 else:
                     self.logger.warning(f"Skipping update for {key} - value is None")
-                    
+                        
             except Exception as e:
                 self.logger.error(
                     f"Failed to process metric:\n"
@@ -2265,6 +2271,9 @@ class MetricsCollector:
                     f"- Error: {e}",
                     exc_info=True
                 )
+
+        # Log final storage state for debugging
+        self.logger.verbose(f"Updated storage keys: {list(self._prometheus_metrics.keys())}")
 
     def _update_internal_metrics(self, successes: int, errors: int, duration: float):
         """Update internal metrics."""
