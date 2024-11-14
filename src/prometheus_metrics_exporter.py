@@ -143,7 +143,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import (
     Any, Awaitable, Callable, Dict, List, Optional, 
-    TYPE_CHECKING, Union
+    Tuple, TYPE_CHECKING, Union
 )
 from wsgiref.simple_server import make_server
 
@@ -1154,69 +1154,59 @@ class MetricLabel:
     filter: Optional[str] = None
     content_type: str = "text"
 
-    @dataclass(frozen=True, eq=True)
-    class MetricIdentifier:
-        """Structured metric identifier."""
-        service: str
-        group: str
-        name: str
-        group_type: MetricGroupType
-        description: str
-        type: Optional[MetricType] = None
-        labels: tuple[MetricLabel, ...] = field(default_factory=tuple)
+@dataclass(frozen=True, eq=True)
+class MetricIdentifier:
+    """Structured metric identifier."""
+    service: str
+    group: str
+    name: str
+    group_type: MetricGroupType
+    description: str
+    type: Optional[MetricType] = None
+    labels: Tuple[MetricLabel, ...] = field(default_factory=tuple)  # Note: Tuple instead of tuple
 
-        def __hash__(self) -> int:
-            """Explicit hash implementation to ensure consistency with labels."""
-            # Convert labels to a stable format for hashing
-            label_tuples = tuple(
-                (label.name, label.value or '') 
+    def __hash__(self) -> int:
+        """Explicit hash implementation to ensure consistency with labels."""
+        label_tuples = tuple(
+            (label.name, label.value or '') 
+            for label in sorted(self.labels, key=lambda x: x.name)
+        )
+        return hash((
+            self.service,
+            self.group, 
+            self.name,
+            self.group_type,
+            self.description,
+            self.type,
+            label_tuples
+        ))
+
+    @property
+    def prometheus_name(self) -> str:
+        """Get prometheus-compatible metric name."""
+        return f"{self.service}_{self.group}_{self.name}"
+
+    def get_label_dict(self) -> Dict[str, str]:
+        """Get labels as a dictionary for Prometheus."""
+        sorted_labels = sorted(self.labels, key=lambda x: x.name)
+        return {label.name: (label.value or '') for label in sorted_labels}
+
+    def get_debug_info(self) -> str:
+        """Get detailed string representation for debugging."""
+        parts = [
+            f"name='{self.prometheus_name}'",
+            f"type={self.type.value if self.type else 'static'}",
+            f"group_type={self.group_type.value}"
+        ]
+        
+        if self.labels:
+            label_strs = [
+                f"{label.name}='{label.value or ''}'"
                 for label in sorted(self.labels, key=lambda x: x.name)
-            )
-            
-            # Include labels in deterministic order
-            return hash((
-                self.service,
-                self.group, 
-                self.name,
-                self.group_type,
-                self.description,
-                self.type,
-                label_tuples  # Use processed label tuples instead of raw labels
-            ))
-
-        @property
-        def prometheus_name(self) -> str:
-            """Get prometheus-compatible metric name."""
-            return f"{self.service}_{self.group}_{self.name}"
-
-        def get_label_dict(self) -> Dict[str, str]:
-            """Get labels as a dictionary for Prometheus.
-            
-            Returns:
-                Dictionary mapping label names to their values.
-                Values are guaranteed to be strings since they are converted
-                during label extraction.
-            """
-            # Sort labels for consistent ordering
-            sorted_labels = sorted(self.labels, key=lambda x: x.name)
-            return {label.name: (label.value or '') for label in sorted_labels}
-
-        def get_debug_info(self) -> str:
-            """Get detailed string representation for debugging."""
-            parts = [
-                f"name='{self.prometheus_name}'",
-                f"type={self.type.value if self.type else 'static'}",
-                f"group_type={self.group_type.value}"
             ]
+            parts.append(f"labels=[{', '.join(label_strs)}]")
             
-            if self.labels:
-                label_strs = [
-                    f"{label.name}='{label.value or ''}'"
-                    for label in sorted(self.labels, key=lambda x: x.name)
-                ]
-                parts.append(f"labels=[{', '.join(label_strs)}]")
-                
-            return f"MetricIdentifier({', '.join(parts)})"
+        return f"MetricIdentifier({', '.join(parts)})"
 
 #-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~-+-~
 
